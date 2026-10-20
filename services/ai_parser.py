@@ -9,7 +9,7 @@ groq_client = Groq(api_key=config.GROQ_API_KEY)
 
 # llama-3.3-70b-versatile — надёжная модель с хорошим JSON-выводом
 PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama3-8b-8192"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 SYSTEM_PROMPT = """Ты — ассистент по учету времени. Проанализируй рассказ пользователя и верни ТОЛЬКО валидный JSON без каких-либо пояснений, markdown-блоков или лишнего текста.
 
