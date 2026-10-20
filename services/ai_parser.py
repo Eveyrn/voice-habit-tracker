@@ -6,6 +6,7 @@ import pytz
 from datetime import datetime, timedelta
 from groq import Groq
 import config
+from services import timeline
 
 groq_client = Groq(api_key=config.GROQ_API_KEY)
 
@@ -42,13 +43,15 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
   "answer": "",
   "activities": [
     {{
-      "title": "Название",
-      "category": "Работа",
+      "title": "Тренировка",
+      "category": "Спорт",
       "utility": "productive",
-      "duration_minutes": 60,
-      "start_time": "{today_date}T08:00:00",
-      "end_time": "{today_date}T09:00:00",
-      "time_exact": true
+      "day": "today",
+      "start": null,
+      "end": null,
+      "duration_min": 90,
+      "ended_ago_min": 60,
+      "part_of_day": null
     }}
   ],
   "tasks_to_add": ["Купить корм коту"],
@@ -60,22 +63,35 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
 
 ДЕЛА (activities) — только то, что УЖЕ произошло.
 - utility: productive — работа, учёба, спорт, чтение, проекты; routine — быт, еда, гигиена, дорога, покупки,
-  общение с близкими; unproductive — залипание в телефоне, бесцельные соцсети, прокрастинация.
+  общение с близкими, сон; unproductive — залипание в телефоне, бесцельные соцсети, сериалы и игры «залипательно»,
+  прокрастинация.
 - category — СТРОГО одно из: {categories}.
-- title — коротко, существительным, без подробностей в скобках: «Залипание в телефоне», «Завтрак», «Работа над ботом».
+- title — коротко, существительным, без подробностей в скобках. Обычные дела называй так:
+  {canonical_titles}.
   Уже известные дела пользователя: {known_titles}
   Если дело по смыслу совпадает с известным — используй ТОЧНО то же название. Новое — только если такого правда нет.
 - Действия, которые шли вместе и одновременно («встретилась с мамой, купили куртки»), — ОДНО дело с общим
   названием («Покупки с мамой»), а не два.
-- ВРЕМЯ. Названо — используй. Если в данных есть связанное событие со временем (напоминание «В 15:00 быть у мамы»,
-  а пользователь пишет «встретилась с мамой») — опирайся на него: с 15:00 до сейчас. Если времени нет совсем —
-  выстрой дела подряд так, чтобы последнее закончилось сейчас ({current_time}). Ничего не ставь в будущее.
-  Дату ставь настоящую: «вчера вечером» — вчерашняя дата.
-- Относительное время считай от «сейчас» ({current_time}): «час назад закончила, шла полтора часа» →
-  end_time = сейчас − 60 мин, start_time = end_time − 90 мин, duration_minutes = 90.
-- time_exact: true — только если время или длительность пользователь назвал сам («с 8 до 10», «час назад,
-  полтора часа»); false — если ты его прикинул («утром ходила в зал», «поела»).
+
+ВРЕМЯ ДЕЛА. НИЧЕГО НЕ ВЫЧИСЛЯЙ — только перенеси то, что сказано. Время посчитает бот.
+- day: "today", "yesterday" или дата "ГГГГ-ММ-ДД".
+- start / end: время "ЧЧ:ММ" (24 часа), ТОЛЬКО если человек его назвал («с 8 до 10» → "08:00" и "10:00»;
+  «в 3 дня» → "15:00"). Если в ДАННЫХ есть связанное событие со временем (напоминание «В 15:00 быть у мамы»,
+  а пишут «встретилась с мамой») — start = время того события. Иначе null.
+- duration_min: сколько длилось, если сказано («полтора часа» → 90) или очевидно («позавтракала» → 20). Иначе null.
+- ended_ago_min: если сказано, сколько времени назад закончилось («час назад закончила» → 60, «только что» → 0). Иначе null.
+- part_of_day: если сказано только «утром» / «днём» / «вечером» / «ночью» → "morning" / "day" / "evening" / "night". Иначе null.
+- Если о времени вообще ничего не сказано — всё null: бот поставит такие дела подряд до «сейчас».
 - В массиве — по порядку времени.
+
+ПРИМЕРЫ (сейчас для примера 20:30):
+«с 8 до 10 сидела в телефоне» → {{"title": "Залипание в телефоне", "day": "today", "start": "08:00", "end": "10:00", "duration_min": null, "ended_ago_min": null, "part_of_day": null}}
+«час назад закончила тренировку, шла полтора часа» → {{"title": "Тренировка", "day": "today", "start": null, "end": null, "duration_min": 90, "ended_ago_min": 60, "part_of_day": null}}
+«утром ходила в зал» → {{"title": "Тренировка", "day": "today", "start": null, "end": null, "duration_min": null, "ended_ago_min": null, "part_of_day": "morning"}}
+«вчера весь вечер смотрела сериал» → {{"title": "Сериал", "day": "yesterday", "start": null, "end": null, "duration_min": 180, "ended_ago_min": null, "part_of_day": "evening"}}
+«поела, а потом 2 часа работала над ботом» → [{{"title": "Еда", "duration_min": 20, "start": null, "end": null, "ended_ago_min": null, "part_of_day": null, "day": "today"}}, {{"title": "Работа над ботом", "duration_min": 120, "start": null, "end": null, "ended_ago_min": null, "part_of_day": null, "day": "today"}}]
+«поспала с часу ночи до девяти» → {{"title": "Сон", "day": "today", "start": "01:00", "end": "09:00", "duration_min": null, "ended_ago_min": null, "part_of_day": null}}
+«потом пойду работать» → это будущее: НЕ дело. Если нет времени — в tasks_to_add.
 
 ЗАДАЧИ (tasks_to_add) — дела на будущее БЕЗ конкретного времени («купить корм коту»). Список строк.
 
@@ -119,7 +135,7 @@ def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str
     kwargs = {
         "model": model,
         "messages": messages,
-        "temperature": 0.1,
+        "temperature": 0,  # меньше случайности: одинаковые фразы — одинаковые ответы
         # gpt-oss сначала «думает», и эти токены входят в лимит — иначе ответ пустой
         "max_tokens": 4000,
         "reasoning_effort": "low",
@@ -234,86 +250,107 @@ EMPTY_RESULT = {
 }
 
 
+async def _ask(messages: list):
+    """Сырой ответ модели: основная с json_object → основная без него → резервная. None, если все упали."""
+    for model, as_json in ((PRIMARY_MODEL, True), (PRIMARY_MODEL, False), (FALLBACK_MODEL, False)):
+        try:
+            raw = await asyncio.to_thread(_call_groq, model, messages, as_json)
+            print(f"[ai_parser] {model}{'' if as_json else ' (без json)'} ответил: {raw[:200]}")
+            return raw
+        except Exception as e:
+            print(f"[ai_parser] {model}{'' if as_json else ' (без json)'} упал: {e}")
+    return None
+
+
+def _load(raw: str):
+    try:
+        data = json.loads(_clean_json(raw))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Если ответ вложен внутрь другого ключа ({"result": {...}})
+    if "activities" not in data and "intent" not in data:
+        for v in data.values():
+            if isinstance(v, dict) and ("activities" in v or "intent" in v):
+                return v
+    return data
+
+
+AGO_RE = re.compile(r"\bназад\b|только что", re.I)
+RANGE_RE = re.compile(r"\bс\s+\d{1,2}([:.]\d{2})?\s+(до|по)\s+\d{1,2}", re.I)
+REGULAR_RE = re.compile(r"кажд|ежедневн|по утрам|по вечерам", re.I)
+
+
+def _problems(data: dict, text: str) -> list[str]:
+    """Проверка ответа модели по самому сообщению. Нашлось что-то — переспрашиваем один раз."""
+    problems = []
+    acts = [a for a in data.get("activities") or [] if isinstance(a, dict)]
+    rems = [r for r in data.get("reminders") or [] if isinstance(r, dict)]
+    if acts and AGO_RE.search(text) and not any(a.get("ended_ago_min") is not None or a.get("end") or a.get("start") for a in acts):
+        problems.append("В сообщении сказано, сколько времени назад это закончилось, — заполни ended_ago_min.")
+    if acts and RANGE_RE.search(text) and not any(a.get("start") for a in acts):
+        problems.append("В сообщении названо время «с … до …» — заполни start и end (ЧЧ:ММ).")
+    if REGULAR_RE.search(text) and any(str(r.get("repeat", "")).lower() == "once" for r in rems):
+        problems.append("Просят напоминать регулярно — у такого напоминания repeat \"daily\".")
+    if text.strip().endswith("?") and data.get("intent") == "log" and not data.get("answer"):
+        problems.append("Это вопрос: intent \"question\", ответ в answer.")
+    for a in acts:
+        if any(k in a for k in ("start_time", "end_time")) and not any(k in a for k in ("start", "end", "ended_ago_min", "part_of_day")):
+            problems.append("Время дела не вычисляй сам: верни поля day / start / end / duration_min / ended_ago_min / part_of_day.")
+            break
+    return problems
+
+
 async def parse_voice_text(text: str, known_titles: list | None = None, about: str = "", context: str = "") -> dict:
     """about — что человек рассказал о себе (/about); context — его день: записи, задачи, напоминания,
     предыдущее сообщение (с номерами, чтобы модель могла отвечать на вопросы и вносить поправки)."""
     tz = pytz.timezone(config.TIMEZONE)
     now = datetime.now(tz)
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     today_date = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M")
 
     prompt = SYSTEM_PROMPT.format(
-        now_str=now_str,
+        now_str=now.strftime("%Y-%m-%d %H:%M:%S"),
         weekday=WEEKDAYS[now.weekday()],
         today_date=today_date,
         tomorrow_date=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
-        current_time=current_time,
+        current_time=now.strftime("%H:%M"),
         tz=config.TIMEZONE,
         about=about.strip() or "о себе не рассказывал(а). Обращайся нейтрально, без рода: не «сделала/сделал», а «готово», «записано».",
         context=context.strip() or "пока ничего нет",
         categories=", ".join(CATEGORIES),
+        canonical_titles=timeline.CANONICAL_HINT,
         known_titles=", ".join(f"«{t}»" for t in known_titles) if known_titles else "пока нет",
     )
+    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
 
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text}
-    ]
-
-    raw_text = None
-
-    # Попытка 1 — основная модель с json_object (поддерживается llama-3.3-70b)
-    try:
-        raw_text = await asyncio.to_thread(_call_groq, PRIMARY_MODEL, messages, True)
-        print(f"[ai_parser] {PRIMARY_MODEL} ответил: {raw_text[:200]}")
-    except Exception as e:
-        print(f"[ai_parser] {PRIMARY_MODEL} упал: {e}")
-        raw_text = None
-
-    # Попытка 2 — основная модель без json_object
-    if raw_text is None:
-        try:
-            raw_text = await asyncio.to_thread(_call_groq, PRIMARY_MODEL, messages, False)
-            print(f"[ai_parser] {PRIMARY_MODEL} (без json) ответил: {raw_text[:200]}")
-        except Exception as e:
-            print(f"[ai_parser] {PRIMARY_MODEL} (без json) упал: {e}")
-            raw_text = None
-
-    # Попытка 3 — резервная модель
-    if raw_text is None:
-        try:
-            raw_text = await asyncio.to_thread(_call_groq, FALLBACK_MODEL, messages, False)
-            print(f"[ai_parser] {FALLBACK_MODEL} ответил: {raw_text[:200]}")
-        except Exception as e:
-            print(f"[ai_parser] {FALLBACK_MODEL} упал: {e}")
-            raw_text = None
-
-    # Все модели упали
-    if raw_text is None:
+    raw = await _ask(messages)
+    if raw is None:
         print("[ai_parser] Все модели упали, возвращаю заглушку.")
         return {**EMPTY_RESULT, "intent": "chat",
                 "answer": "Не получилось разобрать — модель сейчас недоступна. Попробуй ещё раз через минуту."}
+    data = _load(raw)
 
-    # Парсим JSON
-    cleaned = _clean_json(raw_text)
-    try:
-        data = json.loads(cleaned)
-        print(f"[ai_parser] JSON успешно распарсен, активностей: {len(data.get('activities', []))}")
-    except json.JSONDecodeError as e:
-        print(f"[ai_parser] JSONDecodeError: {e}")
-        print(f"[ai_parser] Сырой ответ: {raw_text[:500]}")
+    # Проверка и одна попытка исправить: модель от раза к разу ошибается по-разному
+    problems = _problems(data, text) if data is not None else ["Ответ — не JSON. Верни только JSON в нужном формате."]
+    if problems:
+        print(f"[ai_parser] переспрашиваю: {problems}")
+        retry = messages + [{"role": "assistant", "content": raw},
+                            {"role": "user", "content": "Проверь свой ответ:\n- " + "\n- ".join(problems) +
+                             "\nВерни исправленный JSON целиком, без пояснений."}]
+        raw2 = await _ask(retry)
+        data2 = _load(raw2) if raw2 else None
+        if data2 is not None and (data is None or len(_problems(data2, text)) < len(problems)):
+            data = data2
+
+    if data is None:
         return {**EMPTY_RESULT, "intent": "chat",
                 "answer": "Сообщение дошло, но разобрать его не вышло. Попробуй ещё раз — иногда нужна пара попыток."}
+    return _normalize(data, text, now)
 
-    if not isinstance(data, dict):
-        data = {}
-    # Если ответ вложен внутрь другого ключа ({"result": {...}})
-    if "activities" not in data and "intent" not in data:
-        for v in data.values():
-            if isinstance(v, dict) and ("activities" in v or "intent" in v):
-                data = v
-                break
+
+def _normalize(data: dict, text: str, now: datetime) -> dict:
+    today_date = now.strftime("%Y-%m-%d")
     for key, default in EMPTY_RESULT.items():
         if data.get(key) is None:
             data[key] = [] if isinstance(default, list) else default
@@ -321,15 +358,17 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
         if not isinstance(data[key], list):
             data[key] = []
 
-    # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
     # Категория — только из фиксированного списка, иначе /summary дробится на «залипание в телефоне», «телефон», …
     lower_map = {c.lower(): c for c in CATEGORIES}
-    for act in data["activities"]:
-        if isinstance(act, dict):
-            act["category"] = lower_map.get(str(act.get("category", "")).strip().lower(), "Другое")
-
     data["activities"] = [a for a in data["activities"] if isinstance(a, dict)]
-    data["activities"].sort(key=lambda a: str(a.get("start_time") or ""))
+    for act in data["activities"]:
+        act["category"] = lower_map.get(str(act.get("category", "")).strip().lower(), "Другое")
+        timeline.normalize_title(act)          # «Поела» → «Еда», «зал» → «Тренировка»
+        timeline.refine_meal(act, text)        # «Еда», а в сообщении «позавтракала» → «Завтрак»
+    timeline.resolve_times(data["activities"], now.replace(tzinfo=None))   # время считает код
+    data["activities"].sort(key=lambda a: a["start_time"])
+
+    # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
     data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
     data["reminders"] = _clean_reminders(data.get("reminders"), today_date, text)
@@ -337,7 +376,6 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
     data["intent"] = data["intent"] if data["intent"] in ("log", "question", "correction", "chat") else "log"
     data["answer"] = _as_text(data.get("answer")).replace("**", "")
     data["encouragement"] = _as_text(data.get("encouragement")) if data["intent"] == "log" else ""
-
     return data
 
 
