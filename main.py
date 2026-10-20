@@ -13,7 +13,7 @@ from bot.handlers import (
     router, BOT_COMMANDS, ADMIN_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION,
     day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about, oauth_callback,
 )
-from services import google_oauth
+from services import google_oauth, web_pages
 from database.db_manager import (
     init_db, get_or_create_profile, cleanup_old_reminders,
     get_due_reminders, mark_reminder_sent, pop_snoozed_reminders,
@@ -111,7 +111,8 @@ async def start_web(bot: Bot):
     Хостинг пробрасывает свой HTTPS-домен на SERVER_PORT."""
     app = web.Application()
     app["bot"] = bot
-    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    app.router.add_get("/", lambda request: web.Response(text=web_pages.HOME, content_type="text/html"))
+    app.router.add_get("/privacy", lambda request: web.Response(text=web_pages.PRIVACY, content_type="text/html"))
     app.router.add_get(google_oauth.CALLBACK_PATH, oauth_callback)
     runner = web.AppRunner(app)
     await runner.setup()
