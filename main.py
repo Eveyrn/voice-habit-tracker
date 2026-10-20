@@ -3,14 +3,15 @@ import logging
 import pytz
 from datetime import datetime
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
-from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION, day_report, rhythm_report
+from bot.handlers import router, BOT_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION, day_report, rhythm_report
 from database.db_manager import (
     init_db, get_or_create_profile,
-    get_due_reminders, mark_reminder_sent,
+    get_due_reminders, mark_reminder_sent, pop_snoozed_reminders,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +57,12 @@ async def send_due_reminders(bot: Bot):
     Если бот лежал в нужную минуту — напоминание придёт сразу после запуска."""
     now = datetime.now(pytz.timezone(config.TIMEZONE))
     today_str = now.strftime("%Y-%m-%d")
+    for reminder_id, user_id, text in await pop_snoozed_reminders(now.strftime("%Y-%m-%dT%H:%M")):
+        try:
+            await bot.send_message(chat_id=user_id, text=f"⏰ {text}", reply_markup=reminder_keyboard(reminder_id))
+        except Exception as e:
+            logging.error(f"Ошибка отправки отложенного напоминания {reminder_id}: {e}")
+
     for reminder_id, user_id, text in await get_due_reminders(now.strftime("%H:%M"), today_str):
         try:
             await bot.send_message(chat_id=user_id, text=f"⏰ {text}", reply_markup=reminder_keyboard(reminder_id))
@@ -106,6 +113,11 @@ async def main():
     logging.info("Планировщик напоминаний запущен (11:00, 16:00, 21:30).")
 
     logging.info("Бот запущен и готов к работе...")
+    try:
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
+    except Exception as e:
+        logging.error(f"Не удалось поставить меню команд: {e}")
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

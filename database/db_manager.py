@@ -73,6 +73,20 @@ async def init_db():
                 UNIQUE(user_id, text)
             )
         ''')
+        # Отложенные напоминания: когда прислать ещё раз (ISO-время в config.TIMEZONE)
+        try:
+            await db.execute('ALTER TABLE reminders ADD COLUMN snooze_until TEXT')
+        except aiosqlite.OperationalError:
+            pass  # колонка уже есть
+        # Настройки и «уже предупреждала сегодня»
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER,
+                key TEXT,
+                value TEXT,
+                PRIMARY KEY (user_id, key)
+            )
+        ''')
         await db.commit()
 
 async def get_or_create_profile(user_id: int, today_str: str):
@@ -257,6 +271,44 @@ async def get_activity_stats(user_id, since_date):
                 pass
     all_days = {d for s in stats.values() for d in s["days"]}
     return stats, len(all_days)
+
+async def snooze_reminder(reminder_id, user_id, until_iso):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE reminders SET snooze_until = ? WHERE id = ? AND user_id = ?', (until_iso, reminder_id, user_id))
+        await db.commit()
+
+async def pop_snoozed_reminders(now_iso):
+    """Отложенные напоминания, время которых пришло. Сразу снимает отметку, чтобы не прислать дважды."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT id, user_id, text FROM reminders WHERE snooze_until IS NOT NULL AND snooze_until <= ?', (now_iso,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if rows:
+            await db.execute('UPDATE reminders SET snooze_until = NULL WHERE snooze_until IS NOT NULL AND snooze_until <= ?', (now_iso,))
+            await db.commit()
+    return rows
+
+async def get_setting(user_id, key, default=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT value FROM settings WHERE user_id = ? AND key = ?', (user_id, key)) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else default
+
+async def set_setting(user_id, key, value):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value', (user_id, key, str(value)))
+        await db.commit()
+
+async def get_unproductive_minutes(user_id, date_str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COALESCE(SUM(duration_min), 0) FROM activities WHERE user_id = ? AND utility = 'unproductive' AND start_time LIKE ?",
+            (user_id, f"{date_str}%")
+        ) as cursor:
+            return int((await cursor.fetchone())[0] or 0)
 
 def backup_bytes() -> bytes:
     """Целостная копия базы (через sqlite backup API, даже если бот как раз пишет)."""

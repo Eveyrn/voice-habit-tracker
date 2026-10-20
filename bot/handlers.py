@@ -16,6 +16,20 @@ from services.calendar_api import add_event
 
 router = Router()
 
+# Меню «/» в Telegram — main.py ставит его при запуске
+BOT_COMMANDS = [
+    ("todo", "Задачи"),
+    ("summary", "Итоги дня"),
+    ("plan", "Разбор ритма и расписание"),
+    ("habits", "Привычки и серии"),
+    ("reminders", "Мои напоминания"),
+    ("remind", "Новое напоминание: /remind 10:00 Витамины"),
+    ("limit", "Стоп-сигнал на телефон"),
+    ("patterns", "Повторяющиеся дела"),
+    ("backup", "Копия базы"),
+    ("start", "Справка"),
+]
+
 def check_auth(user_id: int) -> bool:
     if config.ALLOWED_USER_IDS and user_id not in config.ALLOWED_USER_IDS:
         return False
@@ -48,9 +62,43 @@ async def cmd_start(message: types.Message):
         "/reminders — мои напоминания\n"
         "/summary — баланс времени за день\n"
         "/plan — разбор ритма и расписание (по воскресеньям приходит недельный)\n"
+        "/limit 120 — предупредить, когда телефон за день больше 2 ч\n"
         "/backup — прислать копию базы (раз в неделю приходит сама)"
     )
     await message.answer(welcome_text)
+
+# ---------- Стоп-сигнал на телефон ----------
+
+DEFAULT_LIMIT_MIN = 120
+
+
+async def phone_limit_note(user_id: int, today_date: str):
+    """Текст предупреждения, если порог превышен и сегодня ещё не предупреждала; иначе None."""
+    limit = int(await db_manager.get_setting(user_id, "phone_limit_min", DEFAULT_LIMIT_MIN))
+    if limit <= 0 or await db_manager.get_setting(user_id, "phone_limit_warned") == today_date:
+        return None
+    spent = await db_manager.get_unproductive_minutes(user_id, today_date)
+    if spent < limit:
+        return None
+    await db_manager.set_setting(user_id, "phone_limit_warned", today_date)
+    return (f"🔴 Сегодня на телефон и залипание уже {_fmt_min(spent)} — это больше твоих {_fmt_min(limit)}. "
+            "Без оценок, просто чтобы ты знала. Может, 10 минут пройтись или воды выпить?")
+
+
+@router.message(Command("limit"))
+async def cmd_limit(message: types.Message):
+    if not check_auth(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) == 2 and parts[1].isdigit():
+        minutes = int(parts[1])
+        await db_manager.set_setting(message.from_user.id, "phone_limit_min", minutes)
+        await message.answer("Стоп-сигнал выключен." if minutes == 0 else
+                             f"Ок: скажу один раз за день, когда телефон и залипание перевалят за {_fmt_min(minutes)}.")
+        return
+    current = int(await db_manager.get_setting(message.from_user.id, "phone_limit_min", DEFAULT_LIMIT_MIN))
+    state = "выключен" if current == 0 else f"сейчас {_fmt_min(current)} в день"
+    await message.answer(f"Стоп-сигнал на телефон: {state}.\nПоменять: /limit 90 (в минутах), выключить: /limit 0")
 
 # ---------- Разбор ритма ----------
 
@@ -102,7 +150,25 @@ def _now_local():
 def reminder_keyboard(reminder_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Сделала", callback_data=f"remdone_{reminder_id}")
+    builder.button(text="⏰ Через 30 мин", callback_data=f"remsnooze_{reminder_id}")
+    builder.adjust(2)
     return builder.as_markup()
+
+
+SNOOZE_MIN = 30
+
+
+@router.callback_query(F.data.startswith("remsnooze_"))
+async def process_reminder_snooze(callback: types.CallbackQuery):
+    reminder_id = int(callback.data.split("_")[1])
+    reminder = await db_manager.get_reminder(reminder_id, callback.from_user.id)
+    if not reminder:
+        await callback.answer("Это напоминание уже удалено")
+        return
+    until = _now_local() + timedelta(minutes=SNOOZE_MIN)
+    await db_manager.snooze_reminder(reminder_id, callback.from_user.id, until.strftime("%Y-%m-%dT%H:%M"))
+    await callback.answer("Отложено")
+    await callback.message.edit_text(f"⏰ {reminder[1]}\nНапомню ещё раз в {until.strftime('%H:%M')}")
 
 
 async def save_reminder(user_id: int, text: str, time_str: str):
@@ -491,6 +557,12 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         encouragement = analysis.get("encouragement")
         if encouragement:
             response_lines.append(f"\n{encouragement}")
+
+        # Мягкий стоп-сигнал: один раз в день, когда телефон/игры перевалили за порог
+        if any(isinstance(a, dict) and a.get("utility") == "unproductive" for a in activities):
+            note = await phone_limit_note(message.from_user.id, today_date)
+            if note:
+                response_lines.append(f"\n{note}")
 
         builder = InlineKeyboardBuilder()
 
