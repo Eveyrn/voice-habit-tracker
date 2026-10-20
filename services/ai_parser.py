@@ -137,7 +137,7 @@ def _clean_json(raw: str) -> str:
 RHYTHM_PROMPT = """Ты — спокойный коуч по распорядку дня. Разбираешь записи пользователя в Telegram-трекере
 и пишешь ему напрямую, на «ты». О пользователе: {about}
 
-Период: последние {period} дн., из них с записями — {days} дн. Время — местное.
+Записи есть за {days} дн. Время — местное. Говори о «днях с записями», не о неделях.
 
 ПОВТОРЯЮЩИЕСЯ ДЕЛА (были в 2+ днях). Цифры уже посчитаны В СРЕДНЕМ ЗА ДЕНЬ, когда дело было, — не складывай и не умножай их:
 {repeating}
@@ -151,8 +151,20 @@ RHYTHM_PROMPT = """Ты — спокойный коуч по распорядк�
 3. Расписание обычного дня: 5–8 строк вида «09:00–10:00 — …» ТОЛЬКО из повторяющихся дел и базовых вещей
    (сон, еда), опираясь на реальное время из сводки, а не на идеал из книжек. Залипание и прокрастинацию
    в расписание как цель не ставь — вместо них короткое окно отдыха.
-4. Один маленький шаг на завтра.
-Если дней с записями меньше 3 — честно скажи, что данных мало, и дай только то, что видно, без расписания."""
+4. Один маленький шаг на завтра."""
+
+# Пока записей меньше 3 дней — никаких «ритмов» и расписаний: модель иначе выдумывает их по одному дню
+FIRST_DAYS_PROMPT = """Ты — спокойный коуч по распорядку дня. Пользователь только начал вести Telegram-трекер:
+записи есть всего за {days} дн. Пиши ему напрямую, на «ты». О пользователе: {about}
+
+Дела за эти дни (время — местное):
+{items}
+
+Напиши по-русски, очень коротко, обычным текстом без символов * и #:
+1. 2–3 наблюдения о том, как прошли эти дни, с цифрами из списка. Не называй это ритмом или привычками —
+   это просто первые наблюдения. Не упоминай недели и не обобщай.
+2. Один маленький шаг на завтра.
+Расписание НЕ составляй."""
 
 
 def _fmt_hour(hours: list) -> str:
@@ -175,11 +187,16 @@ async def analyze_rhythm(stats: dict, days: int, about: str = "", period: int = 
         else:
             single.append(f"- {title} [{s['utility']}]: {s['minutes']} мин{when}")
 
-    messages = [{"role": "user", "content": RHYTHM_PROMPT.format(
-        period=period, days=days,
-        repeating="\n".join(repeating) or "пока нет",
-        single="\n".join(single[:20]) or "нет",
-        about=about.strip() or "о себе не рассказывал(а) — пиши без рода: не «сделала/сделал»")}]
+    about = about.strip() or "о себе не рассказывал(а) — пиши без рода: не «сделала/сделал»"
+    if days < 3:
+        items = [f"- {title} [{s['utility']}]: {s['minutes']} мин" + (f", около {_fmt_hour(s['hours'])}" if s["hours"] else "")
+                 for title, s in sorted(stats.items(), key=lambda kv: -kv[1]["minutes"])]
+        prompt = FIRST_DAYS_PROMPT.format(days=days, about=about, items="\n".join(items[:30]))
+    else:
+        prompt = RHYTHM_PROMPT.format(days=days, about=about,
+                                      repeating="\n".join(repeating) or "пока нет",
+                                      single="\n".join(single[:20]) or "нет")
+    messages = [{"role": "user", "content": prompt}]
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
             return (await asyncio.to_thread(_call_groq, model, messages, False)).replace("**", "").strip()

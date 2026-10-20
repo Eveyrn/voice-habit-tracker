@@ -457,11 +457,27 @@ async def cmd_limit(message: types.Message):
 
 # ---------- Разбор ритма ----------
 
+def _days_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    return "дня" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "дней"
+
+
 async def rhythm_report(user_id: int, days: int) -> str:
+    """Разбор за последние `days` дней. Шапка честно говорит, за сколько дней на самом деле есть записи."""
     since = (_now_local() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     stats, days_with_data = await db_manager.get_activity_stats(user_id, since)
+    if not stats:
+        return "Пока нет записей — расскажи о паре дней, и я разберу твой ритм."
     about = await db_manager.get_setting(user_id, "about", "")
-    return await analyze_rhythm(stats, days_with_data, about, period=days)
+    text = await analyze_rhythm(stats, days_with_data, about, period=days)
+    header = f"По записям за {days_with_data} {_days_word(days_with_data)}"
+    if days_with_data < 3:
+        header += (" — это первые наблюдения, а не выводы. Расписание появится, когда наберётся хотя бы 3 дня записей; "
+                   "точнее всего — через 1–2 недели.")
+    elif days_with_data < 7:
+        header += " — пока прикидка, через неделю-две станет точнее."
+    return f"{header}\n\n{text}"
 
 
 @router.message(Command("plan"))
@@ -469,9 +485,9 @@ async def cmd_plan(message: types.Message):
     if not check_auth(message.from_user.id):
         await deny(message)
         return
-    status = await message.answer("🧭 Смотрю твои записи за 3 недели…")
+    status = await message.answer("🧭 Смотрю твои записи…")
     text = await rhythm_report(message.from_user.id, 21)
-    await status.edit_text(f"🧭 Твой ритм и расписание\n\n{text}")
+    await status.edit_text(f"🧭 Твой ритм\n\n{text}")
 
 
 # ---------- Бэкап (только админам: в файле данные всех пользователей) ----------
