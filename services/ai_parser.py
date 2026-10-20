@@ -8,8 +8,8 @@ import config
 
 groq_client = Groq(api_key=config.GROQ_API_KEY)
 
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+PRIMARY_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODEL = "openai/gpt-oss-20b"
 
 SYSTEM_PROMPT = """Ты — ассистент по учёту времени. Проанализируй текст пользователя и верни ТОЛЬКО валидный JSON.
 
@@ -21,21 +21,21 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
 - unproductive: залипание в телефоне, прокрастинация, бесцельное время
 
 Верни JSON строго в этом формате:
-{
+{{
   "activities": [
-    {
+    {{
       "title": "Название",
       "category": "Категория",
       "utility": "productive",
       "duration_minutes": 60,
       "start_time": "2024-01-01T08:00:00",
       "end_time": "2024-01-01T09:00:00"
-    }
+    }}
   ],
   "tasks_to_add": [],
   "habit_identified": null,
   "encouragement": "Мотивирующая фраза на русском"
-}
+}}
 
 Замени дату на {today_date}. Никакого текста кроме JSON."""
 
@@ -46,13 +46,18 @@ def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str
         "model": model,
         "messages": messages,
         "temperature": 0.1,
-        "max_tokens": 800,
+        # gpt-oss сначала «думает», и эти токены входят в лимит — иначе ответ пустой
+        "max_tokens": 4000,
+        "reasoning_effort": "low",
     }
     if use_json_format:
         kwargs["response_format"] = {"type": "json_object"}
 
     response = groq_client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        raise ValueError("модель вернула пустой ответ")
+    return content
 
 
 def _clean_json(raw: str) -> str:
