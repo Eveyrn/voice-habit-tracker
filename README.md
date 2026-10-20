@@ -8,14 +8,14 @@
 
 | Часть | Файл |
 |---|---|
-| Запуск, планировщик (чекины 11:00 / 16:00 / 21:30, напоминания раз в минуту, бэкап по воскресеньям) | `main.py` |
+| Запуск, планировщик (чекины 11:00 / 16:00 / 21:30, напоминания раз в минуту, по воскресеньям разбор недели в 20:00 и бэкап в 22:00) | `main.py` |
 | Команды и обработка сообщений | `bot/handlers.py` |
 | Голос → текст (Groq Whisper) | `services/stt.py` |
 | Текст → дела / задачи / напоминания (Groq `openai/gpt-oss-120b`, запасная `gpt-oss-20b`) | `services/ai_parser.py` |
 | Google Календарь | `services/calendar_api.py`, вход — `auth_calendar.py` |
 | База SQLite | `database/db_manager.py` → `database/tracker.db` |
 
-Команды: `/todo`, `/habits`, `/patterns`, `/summary`, `/remind 10:00 Выпить витамины`, `/reminders`, `/backup`.
+Команды: `/todo`, `/habits`, `/patterns`, `/summary`, `/plan`, `/remind 10:00 Выпить витамины`, `/reminders`, `/backup`.
 
 ## Настройки (`.env`, в git не попадает)
 

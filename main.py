@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
-from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION, day_report
+from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION, day_report, rhythm_report
 from database.db_manager import (
     init_db, get_or_create_profile,
     get_due_reminders, mark_reminder_sent,
@@ -64,6 +64,11 @@ async def send_due_reminders(bot: Bot):
         # Отмечаем в любом случае, чтобы при ошибке не слать каждую минуту
         await mark_reminder_sent(reminder_id, today_str)
 
+async def weekly_review(bot: Bot):
+    """Воскресенье: разбор ритма за неделю."""
+    text = await rhythm_report(config.ALLOWED_USER_IDS[0], 7)
+    await send_checkin(bot, f"🗓 Итоги недели\n\n{text}")
+
 async def send_backup(bot: Bot):
     """Раз в неделю присылает файл базы в Telegram — копия на случай, если хостинг потеряет данные."""
     for user_id in config.ALLOWED_USER_IDS:
@@ -94,6 +99,7 @@ async def main():
     scheduler.add_job(afternoon_checkin, 'cron', hour=16, minute=0, args=[bot])
     scheduler.add_job(evening_checkin, 'cron', hour=21, minute=30, args=[bot])
     scheduler.add_job(send_due_reminders, 'cron', minute='*', args=[bot])
+    scheduler.add_job(weekly_review, 'cron', day_of_week='sun', hour=20, minute=0, args=[bot])
     scheduler.add_job(send_backup, 'cron', day_of_week='sun', hour=22, minute=0, args=[bot])
 
     scheduler.start()

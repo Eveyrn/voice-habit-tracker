@@ -99,6 +99,39 @@ def _clean_json(raw: str) -> str:
     return raw
 
 
+RHYTHM_PROMPT = """Ты — спокойный коуч по распорядку дня. Ниже сводка записей пользовательницы за {days} дн.
+(она разработчица, делает Telegram-ботов и проект ELGE). Время — местное.
+
+{stats}
+
+Напиши по-русски, коротко, обычным текстом без markdown-таблиц и без символов * и #:
+1. Ритм — 2–3 наблюдения с цифрами (когда она продуктивнее всего, сколько уходит на телефон и в какое время).
+2. Что съедает время — одно главное.
+3. Предложение расписания на обычный день: 5–8 строк вида «09:00–10:00 — …», опираясь на её реальные привычки, а не на идеал из книжек.
+4. Один маленький шаг на завтра.
+Если данных мало (меньше 3 дней), честно скажи об этом и дай только то, что можно сказать."""
+
+
+async def analyze_rhythm(stats: dict, days: int) -> str:
+    """Разбор ритма по сводке get_activity_stats. Возвращает готовый текст для Telegram."""
+    if not stats:
+        return "Пока нет записей за этот период — расскажи мне о паре дней, и я разберу твой ритм."
+
+    lines = []
+    for title, s in sorted(stats.items(), key=lambda kv: -kv[1]["minutes"]):
+        hours = s["hours"]
+        when = f", обычно начинается около {int(sum(hours) / len(hours)):02d}:{int(sum(hours) / len(hours) % 1 * 60):02d}" if hours else ""
+        lines.append(f"- {title} [{s['utility']}, {s['category']}]: {len(s['days'])} дн., всего {s['minutes']} мин{when}")
+
+    messages = [{"role": "user", "content": RHYTHM_PROMPT.format(days=days, stats="\n".join(lines))}]
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            return (await asyncio.to_thread(_call_groq, model, messages, False)).replace("**", "").strip()
+        except Exception as e:
+            print(f"[analyze_rhythm] {model} упала: {e}")
+    return "Не получилось сделать разбор — модель сейчас недоступна, попробуй через пару минут."
+
+
 CATEGORIES = ["Работа", "Учёба", "Спорт", "Еда", "Быт", "Здоровье", "Сон", "Дорога", "Общение", "Отдых", "Телефон", "Другое"]
 
 

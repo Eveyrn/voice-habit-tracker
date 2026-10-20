@@ -2,7 +2,7 @@
 import re
 import pytz
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Router, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import BufferedInputFile
@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import config
 from database import db_manager
 from services.stt import transcribe_audio
-from services.ai_parser import parse_voice_text
+from services.ai_parser import parse_voice_text, analyze_rhythm
 from services.calendar_api import add_event
 
 router = Router()
@@ -33,10 +33,11 @@ async def cmd_start(message: types.Message):
 
     welcome_text = (
         "Привет! Я твой персональный AI-трекер жизни и привычек.\n\n"
-        f"🕵️‍♂️ **Режим наблюдения: День {profile['days_passed']} из {profile['target_days']}**\n"
+        f"🕵️‍♂️ Режим наблюдения: день {profile['days_passed']} из {profile['target_days']}\n"
         "В эти 3 недели Календарь отдыхает и не засоряется. Я просто внимательно собираю статистику "
         "твоего естественного ритма дня, циклы быта и отдыха.\n\n"
-        "Через 3 недели я автоматически сформирую твоё идеальное расписание и подключу Google / Samsung / Redmi календарь!\n\n"
+        "Разбор ритма и предложение расписания — в любой момент по /plan (точнее всего через 1–3 недели записей). "
+        "После 3 недель дела начнут попадать в Google Календарь (он же виден в Samsung / Redmi).\n\n"
         "🎙 Просто присылай голосовые (или пиши текстом) о том, как прошёл день или дело:\n"
         "- 'С 14:00 до 18:00 работала, потом час смотрела сериал'\n\n"
         "Команды:\n"
@@ -46,9 +47,26 @@ async def cmd_start(message: types.Message):
         "/remind 10:00 Выпить витамины — ежедневное напоминание\n"
         "/reminders — мои напоминания\n"
         "/summary — баланс времени за день\n"
+        "/plan — разбор ритма и расписание (по воскресеньям приходит недельный)\n"
         "/backup — прислать копию базы (раз в неделю приходит сама)"
     )
     await message.answer(welcome_text)
+
+# ---------- Разбор ритма ----------
+
+async def rhythm_report(user_id: int, days: int) -> str:
+    since = (_now_local() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    stats, days_with_data = await db_manager.get_activity_stats(user_id, since)
+    return await analyze_rhythm(stats, days_with_data)
+
+
+@router.message(Command("plan"))
+async def cmd_plan(message: types.Message):
+    if not check_auth(message.from_user.id):
+        return
+    status = await message.answer("🧭 Смотрю твои записи за 3 недели…")
+    text = await rhythm_report(message.from_user.id, 21)
+    await status.edit_text(f"🧭 Твой ритм и расписание\n\n{text}")
 
 # ---------- Бэкап ----------
 

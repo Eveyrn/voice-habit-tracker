@@ -236,6 +236,28 @@ async def mark_reminder_sent(reminder_id, today_date):
         await db.execute('UPDATE reminders SET last_sent = ? WHERE id = ?', (today_date, reminder_id))
         await db.commit()
 
+async def get_activity_stats(user_id, since_date):
+    """Сводка дел с даты since_date: по каждому названию — сколько дней, минут всего, во сколько обычно начинается."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT title, utility, category, duration_min, start_time FROM activities
+            WHERE user_id = ? AND substr(start_time, 1, 10) >= ?
+        ''', (user_id, since_date)) as cursor:
+            rows = await cursor.fetchall()
+
+    stats = {}
+    for title, utility, category, duration, start in rows:
+        s = stats.setdefault(_pattern_title(title), {"utility": utility, "category": category, "days": set(), "minutes": 0, "hours": []})
+        s["minutes"] += int(duration or 0)
+        if start and len(start) >= 13:
+            s["days"].add(start[:10])
+            try:
+                s["hours"].append(int(start[11:13]) + int(start[14:16]) / 60)
+            except ValueError:
+                pass
+    all_days = {d for s in stats.values() for d in s["days"]}
+    return stats, len(all_days)
+
 def backup_bytes() -> bytes:
     """Целостная копия базы (через sqlite backup API, даже если бот как раз пишет)."""
     tmp_path = DB_PATH + ".backup"
