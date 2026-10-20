@@ -1,5 +1,6 @@
 ﻿import aiosqlite
 import sqlite3
+import json
 import os
 from datetime import datetime
 
@@ -35,11 +36,31 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS habits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                name TEXT UNIQUE,
+                name TEXT,
                 streak INTEGER DEFAULT 0,
-                last_completed TEXT
+                last_completed TEXT,
+                UNIQUE(user_id, name)
             )
         ''')
+        # Старые базы: name был уникален на ВСЕХ пользователей — у второго человека
+        # с привычкой «Выпить витамины» вставка падала. Пересобираем таблицу.
+        async with db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'habits'") as cursor:
+            row = await cursor.fetchone()
+        if row and "name TEXT UNIQUE" in row[0]:
+            await db.executescript('''
+                CREATE TABLE habits_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    name TEXT,
+                    streak INTEGER DEFAULT 0,
+                    last_completed TEXT,
+                    UNIQUE(user_id, name)
+                );
+                INSERT INTO habits_new (id, user_id, name, streak, last_completed)
+                    SELECT id, user_id, name, streak, last_completed FROM habits;
+                DROP TABLE habits;
+                ALTER TABLE habits_new RENAME TO habits;
+            ''')
         # Таблица профиля и фазы наблюдения
         await db.execute('''
             CREATE TABLE IF NOT EXISTS user_profile (
@@ -73,11 +94,33 @@ async def init_db():
                 UNIQUE(user_id, text)
             )
         ''')
-        # Отложенные напоминания: когда прислать ещё раз (ISO-время в config.TIMEZONE)
-        try:
-            await db.execute('ALTER TABLE reminders ADD COLUMN snooze_until TEXT')
-        except aiosqlite.OperationalError:
-            pass  # колонка уже есть
+        # snooze_until — отложено до (ISO-время в config.TIMEZONE);
+        # date — для разовых напоминаний (ГГГГ-ММ-ДД), NULL — каждый день
+        for column in ("snooze_until TEXT", "date TEXT"):
+            try:
+                await db.execute(f'ALTER TABLE reminders ADD COLUMN {column}')
+            except aiosqlite.OperationalError:
+                pass  # колонка уже есть
+        # Пользователи: кто попросил доступ и кого пустили (админы — из ALLOWED_USER_IDS, им запись не нужна)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                username TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Записи (одно сообщение = одна запись): что из него создано — для «Отменить» и для поправок
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                data TEXT,
+                created_at TEXT
+            )
+        ''')
         # Настройки и «уже предупреждала сегодня»
         await db.execute('''
             CREATE TABLE IF NOT EXISTS settings (
@@ -210,26 +253,61 @@ async def get_habits(user_id):
         async with db.execute('SELECT name, streak, last_completed FROM habits WHERE user_id = ?', (user_id,)) as cursor:
             return await cursor.fetchall()
 
-async def add_reminder(user_id, text, time, now_time, today_date):
-    """Создаёт напоминание или меняет время у существующего с тем же текстом.
-    Если время на сегодня уже прошло — первое срабатывание будет завтра."""
-    last_sent = today_date if time <= now_time else None
+def _last_sent_for(time, date, now_time, today_date):
+    """Чтобы напоминание не сработало сразу: ежедневное с уже прошедшим временем — с завтра."""
+    if date is None and time <= now_time:
+        return today_date
+    return None
+
+async def add_reminder(user_id, text, time, now_time, today_date, date=None):
+    """Создаёт напоминание или меняет существующее с тем же текстом. Возвращает id.
+    date=None — каждый день; date='ГГГГ-ММ-ДД' — один раз. time='meal' — после еды."""
+    last_sent = _last_sent_for(time, date, now_time, today_date)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
-            INSERT INTO reminders (user_id, text, time, last_sent) VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, text) DO UPDATE SET time = excluded.time, last_sent = excluded.last_sent
-        ''', (user_id, text, time, last_sent))
+            INSERT INTO reminders (user_id, text, time, last_sent, date) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, text) DO UPDATE SET
+                time = excluded.time, last_sent = excluded.last_sent, date = excluded.date, snooze_until = NULL
+        ''', (user_id, text, time, last_sent, date))
         await db.commit()
+        async with db.execute('SELECT id FROM reminders WHERE user_id = ? AND text = ?', (user_id, text)) as cursor:
+            return (await cursor.fetchone())[0]
 
-async def get_reminders(user_id):
+async def update_reminder(reminder_id, user_id, now_time, today_date, **fields):
+    """Меняет time и/или date (date=None — сделать ежедневным). Пересчитывает, когда сработает."""
+    row = await get_reminder(reminder_id, user_id)
+    if not row:
+        return None
+    _, text, time, date = row
+    time = fields.get("time", time)
+    date = fields["date"] if "date" in fields else date
+    last_sent = _last_sent_for(time, date, now_time, today_date)
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, text, time FROM reminders WHERE user_id = ? ORDER BY time', (user_id,)) as cursor:
+        await db.execute('UPDATE reminders SET time = ?, date = ?, last_sent = ?, snooze_until = NULL WHERE id = ? AND user_id = ?',
+                         (time, date, last_sent, reminder_id, user_id))
+        await db.commit()
+    return (reminder_id, text, time, date)
+
+async def get_reminders(user_id, from_date=None):
+    """(id, text, time, date). Разовые — только начиная с from_date (по умолчанию все)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT id, text, time, date FROM reminders
+            WHERE user_id = ? AND (date IS NULL OR ? IS NULL OR date >= ?)
+            ORDER BY date IS NOT NULL, date, time
+        ''', (user_id, from_date, from_date)) as cursor:
             return await cursor.fetchall()
 
 async def get_reminder(reminder_id, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, text, time FROM reminders WHERE id = ? AND user_id = ?', (reminder_id, user_id)) as cursor:
+        async with db.execute('SELECT id, text, time, date FROM reminders WHERE id = ? AND user_id = ?', (reminder_id, user_id)) as cursor:
             return await cursor.fetchone()
+
+async def cleanup_old_reminders(today_date):
+    """Разовые напоминания за прошедшие дни больше не нужны."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM reminders WHERE date IS NOT NULL AND date < ?', (today_date,))
+        await db.commit()
 
 async def delete_reminder(reminder_id, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -237,12 +315,13 @@ async def delete_reminder(reminder_id, user_id):
         await db.commit()
 
 async def get_due_reminders(time_str, today_date):
-    """Напоминания на это время, которые сегодня ещё не отправлялись."""
+    """Напоминания на это время, которые сегодня ещё не отправлялись (ежедневные и разовые на сегодня).
+    'meal' сюда не попадает: 'meal' > '23:59' при сравнении строк."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('''
             SELECT id, user_id, text FROM reminders
-            WHERE time <= ? AND (last_sent IS NULL OR last_sent != ?)
-        ''', (time_str, today_date)) as cursor:
+            WHERE time <= ? AND (date IS NULL OR date = ?) AND (last_sent IS NULL OR last_sent != ?)
+        ''', (time_str, today_date, today_date)) as cursor:
             return await cursor.fetchall()
 
 async def mark_reminder_sent(reminder_id, today_date):
@@ -324,37 +403,156 @@ def backup_bytes() -> bytes:
     os.remove(tmp_path)
     return data
 
-async def undo_entry(user_id, act_from, act_to, task_from, task_to):
-    """Удаляет дела и задачи одной записи. Возвращает True, если что-то из неё ушло в календарь."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            'SELECT title FROM activities WHERE user_id = ? AND id BETWEEN ? AND ?',
-            (user_id, act_from, act_to)
-        ) as cursor:
-            rows = await cursor.fetchall()
-        await db.execute('DELETE FROM activities WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, act_from, act_to))
-        await db.execute('DELETE FROM tasks WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, task_from, task_to))
+async def _recount_patterns(db, user_id, titles):
+    """Пересчитывает ритмы по оставшимся делам — после удаления или переименования.
+    Иначе удалённое дело осталось бы в анализе (или пропало, хотя в другой записи за тот же день оно есть)."""
+    affected = {_pattern_title(t) for t in titles if t}
+    if not affected:
+        return
+    async with db.execute(
+        'SELECT title, utility, COALESCE(substr(start_time, 1, 10), substr(created_at, 1, 10)) FROM activities WHERE user_id = ?',
+        (user_id,)
+    ) as cursor:
+        remaining = await cursor.fetchall()
+    for t in affected:
+        matches = [(u, day) for title, u, day in remaining if _pattern_title(title) == t and day]
+        days = sorted({day for _, day in matches})
+        if days:
+            await db.execute('''
+                INSERT INTO patterns (user_id, title, utility, count_logs, last_performed, avg_interval_days)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(user_id, title) DO UPDATE SET count_logs = excluded.count_logs, last_performed = excluded.last_performed
+            ''', (user_id, t, matches[0][0], len(days), days[-1]))
+        else:
+            await db.execute('DELETE FROM patterns WHERE user_id = ? AND title = ?', (user_id, t))
 
-        # Пересчитываем ритмы по оставшимся записям, иначе отменённое дело останется в анализе
-        # (или, наоборот, пропадёт, хотя в другой записи за тот же день оно есть)
-        affected = {_pattern_title(r[0]) for r in rows}
-        if affected:
-            async with db.execute(
-                'SELECT title, COALESCE(substr(start_time, 1, 10), substr(created_at, 1, 10)) FROM activities WHERE user_id = ?',
-                (user_id,)
-            ) as cursor:
-                remaining = await cursor.fetchall()
-            for t in affected:
-                days = sorted({day for title, day in remaining if _pattern_title(title) == t and day})
-                if days:
-                    await db.execute(
-                        'UPDATE patterns SET count_logs = ?, last_performed = ? WHERE user_id = ? AND title = ?',
-                        (len(days), days[-1], user_id, t))
-                else:
-                    await db.execute('DELETE FROM patterns WHERE user_id = ? AND title = ?', (user_id, t))
+async def delete_items(user_id, activity_ids=(), task_ids=(), reminder_ids=()):
+    """Удаляет дела/задачи/напоминания пользователя по id. Возвращает число удалённых дел."""
+    activity_ids, task_ids, reminder_ids = list(activity_ids), list(task_ids), list(reminder_ids)
+    async with aiosqlite.connect(DB_PATH) as db:
+        titles = []
+        if activity_ids:
+            marks = ",".join("?" * len(activity_ids))
+            async with db.execute(f'SELECT title FROM activities WHERE user_id = ? AND id IN ({marks})', (user_id, *activity_ids)) as cursor:
+                titles = [r[0] for r in await cursor.fetchall()]
+            await db.execute(f'DELETE FROM activities WHERE user_id = ? AND id IN ({marks})', (user_id, *activity_ids))
+        if task_ids:
+            await db.execute(f'DELETE FROM tasks WHERE user_id = ? AND id IN ({",".join("?" * len(task_ids))})', (user_id, *task_ids))
+        if reminder_ids:
+            await db.execute(f'DELETE FROM reminders WHERE user_id = ? AND id IN ({",".join("?" * len(reminder_ids))})', (user_id, *reminder_ids))
+        await _recount_patterns(db, user_id, titles)
         await db.commit()
-    profile_phase = await _phase(user_id)
-    return bool(rows) and profile_phase == 'coaching'
+    return len(titles)
+
+async def undo_entry(user_id, act_from, act_to, task_from, task_to):
+    """Старые кнопки «Отменить» (диапазоны id). Возвращает True, если что-то ушло в календарь."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id FROM activities WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, act_from, act_to)) as cursor:
+            acts = [r[0] for r in await cursor.fetchall()]
+        async with db.execute('SELECT id FROM tasks WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, task_from, task_to)) as cursor:
+            tasks = [r[0] for r in await cursor.fetchall()]
+    deleted = await delete_items(user_id, acts, tasks)
+    return bool(deleted) and await _phase(user_id) == 'coaching'
+
+async def get_activities_for_day(user_id, date_str):
+    """(id, title, utility, category, duration_min, start_time, end_time) за день, по времени."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT id, title, utility, category, duration_min, start_time, end_time FROM activities
+            WHERE user_id = ? AND start_time LIKE ? ORDER BY start_time
+        ''', (user_id, f"{date_str}%")) as cursor:
+            return await cursor.fetchall()
+
+async def update_activity(activity_id, user_id, **fields):
+    """Поправка дела: title / utility / category / start_time / end_time. Длительность пересчитывается по времени."""
+    allowed = {k: v for k, v in fields.items() if k in ("title", "utility", "category", "start_time", "end_time") and v}
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT title, start_time, end_time FROM activities WHERE id = ? AND user_id = ?', (activity_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+        if not row or not allowed:
+            return None
+        old_title, start, end = row
+        start, end = allowed.get("start_time", start), allowed.get("end_time", end)
+        try:
+            minutes = int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() // 60)
+            if minutes > 0:
+                allowed["duration_min"] = minutes
+        except (TypeError, ValueError):
+            pass
+        sets = ", ".join(f"{k} = ?" for k in allowed)
+        await db.execute(f'UPDATE activities SET {sets} WHERE id = ? AND user_id = ?', (*allowed.values(), activity_id, user_id))
+        await _recount_patterns(db, user_id, [old_title, allowed.get("title")])
+        await db.commit()
+        async with db.execute('SELECT id, title, utility, category, duration_min, start_time, end_time FROM activities WHERE id = ?', (activity_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def get_task(task_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, title FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id)) as cursor:
+            return await cursor.fetchone()
+
+# ---------- Записи (для «Отменить» и поправок) ----------
+
+async def add_entry(user_id, text, data: dict, created_at):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute('INSERT INTO entries (user_id, text, data, created_at) VALUES (?, ?, ?, ?)',
+                                  (user_id, text, json.dumps(data, ensure_ascii=False), created_at))
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_entry(entry_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, text, data, created_at FROM entries WHERE id = ? AND user_id = ?', (entry_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+    return (row[0], row[1], json.loads(row[2] or "{}"), row[3]) if row else None
+
+async def get_last_entry(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, text, data, created_at FROM entries WHERE user_id = ? ORDER BY id DESC LIMIT 1', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    return (row[0], row[1], json.loads(row[2] or "{}"), row[3]) if row else None
+
+# ---------- Пользователи ----------
+
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id, name, username, status FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def add_user_request(user_id, name, username):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('INSERT OR IGNORE INTO users (user_id, name, username, status) VALUES (?, ?, ?, "pending")',
+                         (user_id, name, username))
+        await db.commit()
+
+async def set_user_status(user_id, status):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE users SET status = ? WHERE user_id = ?', (status, user_id))
+        await db.commit()
+
+async def list_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id, name, username, status FROM users ORDER BY created_at') as cursor:
+            return await cursor.fetchall()
+
+async def active_user_ids():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id FROM users WHERE status = "active"') as cursor:
+            return [r[0] for r in await cursor.fetchall()]
+
+async def delete_user_data(user_id):
+    """Стирает все записи человека (сам доступ остаётся)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for table in ("activities", "tasks", "habits", "patterns", "reminders", "entries", "settings", "user_profile"):
+            await db.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
+        await db.commit()
+
+async def bump_usage(user_id, date_str) -> int:
+    """+1 к счётчику записей за день, возвращает новое значение."""
+    key = f"usage:{date_str}"
+    count = int(await get_setting(user_id, key, 0)) + 1
+    await set_setting(user_id, key, count)
+    return count
 
 async def _phase(user_id):
     async with aiosqlite.connect(DB_PATH) as db:
