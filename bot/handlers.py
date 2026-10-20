@@ -1,4 +1,5 @@
 ﻿import os
+import re
 import pytz
 import asyncio
 from datetime import datetime
@@ -41,9 +42,96 @@ async def cmd_start(message: types.Message):
         "/patterns — выявленные циклы и ритмы\n"
         "/todo — список текущих задач\n"
         "/habits — прогресс привычек\n"
+        "/remind 10:00 Выпить витамины — ежедневное напоминание\n"
+        "/reminders — мои напоминания\n"
         "/summary — баланс времени за день"
     )
     await message.answer(welcome_text)
+
+# ---------- Напоминания ----------
+
+TIME_RE = re.compile(r"^(\d{1,2})[:.](\d{2})$")
+
+
+def _now_local():
+    return datetime.now(pytz.timezone(config.TIMEZONE))
+
+
+def reminder_keyboard(reminder_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Сделала", callback_data=f"remdone_{reminder_id}")
+    return builder.as_markup()
+
+
+async def save_reminder(user_id: int, text: str, time_str: str):
+    now = _now_local()
+    await db_manager.add_reminder(user_id, text, time_str, now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
+
+
+@router.message(Command("remind"))
+async def cmd_remind(message: types.Message):
+    if not check_auth(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    m = TIME_RE.match(parts[1]) if len(parts) == 3 else None
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        await message.answer(
+            "Напиши время и что напомнить:\n"
+            "/remind 10:00 Выпить витамины\n\n"
+            "Буду напоминать каждый день, а кнопка «✅ Сделала» отметит привычку."
+        )
+        return
+
+    time_str = f"{int(m.group(1)):02d}:{m.group(2)}"
+    text = parts[2].strip()
+    await save_reminder(message.from_user.id, text, time_str)
+    await message.answer(f"⏰ Буду напоминать каждый день в {time_str}: {text}")
+
+
+async def _reminders_view(user_id: int):
+    reminders = await db_manager.get_reminders(user_id)
+    if not reminders:
+        return "Напоминаний пока нет.\nДобавить: /remind 10:00 Выпить витамины", None
+
+    builder = InlineKeyboardBuilder()
+    text = "⏰ Ежедневные напоминания:\n\n"
+    for r_id, r_text, r_time in reminders:
+        text += f"{r_time} — {r_text}\n"
+        builder.button(text=f"🗑 {r_time} {r_text[:20]}", callback_data=f"remdel_{r_id}")
+    builder.adjust(1)
+    return text, builder.as_markup()
+
+
+@router.message(Command("reminders"))
+async def cmd_reminders(message: types.Message):
+    if not check_auth(message.from_user.id):
+        return
+    text, markup = await _reminders_view(message.from_user.id)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("remdel_"))
+async def process_reminder_delete(callback: types.CallbackQuery):
+    reminder_id = int(callback.data.split("_")[1])
+    await db_manager.delete_reminder(reminder_id, callback.from_user.id)
+    await callback.answer("Напоминание удалено")
+    text, markup = await _reminders_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("remdone_"))
+async def process_reminder_done(callback: types.CallbackQuery):
+    reminder_id = int(callback.data.split("_")[1])
+    reminder = await db_manager.get_reminder(reminder_id, callback.from_user.id)
+    if not reminder:
+        await callback.answer("Это напоминание уже удалено")
+        return
+
+    _, r_text, _ = reminder
+    streak = await db_manager.update_habit(callback.from_user.id, r_text, _now_local().strftime("%Y-%m-%d"))
+    await callback.answer("Отмечено!")
+    await callback.message.edit_text(f"✅ {r_text} — сделано\n🔥 Серия: {streak} дн. подряд")
 
 @router.message(Command("patterns"))
 async def cmd_patterns(message: types.Message):
@@ -250,6 +338,17 @@ async def handle_voice(message: types.Message):
         if habit:
             streak = await db_manager.update_habit(message.from_user.id, habit, today_date)
             response_lines.append(f"\nПривычка: {habit} (Серия: {streak} дн.)")
+
+        # 5.1 Просьбы напоминать
+        for rem in analysis.get("reminders", []):
+            if rem["time"]:
+                await save_reminder(message.from_user.id, rem["text"], rem["time"])
+                response_lines.append(f"\n⏰ Буду напоминать каждый день в {rem['time']}: {rem['text']}")
+            else:
+                response_lines.append(
+                    f"\n⏰ Во сколько напоминать «{rem['text']}»? Напиши, например:\n"
+                    f"/remind 10:00 {rem['text']}"
+                )
 
         # 6. Поддержка
         encouragement = analysis.get("encouragement")

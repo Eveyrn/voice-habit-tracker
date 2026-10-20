@@ -61,6 +61,17 @@ async def init_db():
                 UNIQUE(user_id, title)
             )
         ''')
+        # Ежедневные напоминания (время — ЧЧ:ММ в config.TIMEZONE)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                time TEXT,
+                last_sent TEXT,
+                UNIQUE(user_id, text)
+            )
+        ''')
         await db.commit()
 
 async def get_or_create_profile(user_id: int, today_str: str):
@@ -160,7 +171,13 @@ async def update_habit(user_id, habit_name, today_date):
             habit_id, streak, last_completed = row
             if last_completed == today_date:
                 return streak
-            streak += 1
+            # Серия продолжается, только если вчера тоже было сделано
+            d_today = datetime.strptime(today_date, "%Y-%m-%d")
+            try:
+                gap = (d_today - datetime.strptime(last_completed, "%Y-%m-%d")).days
+            except (TypeError, ValueError):
+                gap = None
+            streak = streak + 1 if gap == 1 else 1
             await db.execute('UPDATE habits SET streak = ?, last_completed = ? WHERE id = ?', (streak, today_date, habit_id))
         else:
             streak = 1
@@ -172,6 +189,46 @@ async def get_habits(user_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT name, streak, last_completed FROM habits WHERE user_id = ?', (user_id,)) as cursor:
             return await cursor.fetchall()
+
+async def add_reminder(user_id, text, time, now_time, today_date):
+    """Создаёт напоминание или меняет время у существующего с тем же текстом.
+    Если время на сегодня уже прошло — первое срабатывание будет завтра."""
+    last_sent = today_date if time <= now_time else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO reminders (user_id, text, time, last_sent) VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, text) DO UPDATE SET time = excluded.time, last_sent = excluded.last_sent
+        ''', (user_id, text, time, last_sent))
+        await db.commit()
+
+async def get_reminders(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, text, time FROM reminders WHERE user_id = ? ORDER BY time', (user_id,)) as cursor:
+            return await cursor.fetchall()
+
+async def get_reminder(reminder_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, text, time FROM reminders WHERE id = ? AND user_id = ?', (reminder_id, user_id)) as cursor:
+            return await cursor.fetchone()
+
+async def delete_reminder(reminder_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM reminders WHERE id = ? AND user_id = ?', (reminder_id, user_id))
+        await db.commit()
+
+async def get_due_reminders(time_str, today_date):
+    """Напоминания на это время, которые сегодня ещё не отправлялись."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT id, user_id, text FROM reminders
+            WHERE time <= ? AND (last_sent IS NULL OR last_sent != ?)
+        ''', (time_str, today_date)) as cursor:
+            return await cursor.fetchall()
+
+async def mark_reminder_sent(reminder_id, today_date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE reminders SET last_sent = ? WHERE id = ?', (today_date, reminder_id))
+        await db.commit()
 
 async def get_today_summary(user_id, date_str):
     async with aiosqlite.connect(DB_PATH) as db:

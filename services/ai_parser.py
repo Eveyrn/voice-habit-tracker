@@ -20,6 +20,13 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
 - routine: быт, уборка, еда, гигиена, готовка
 - unproductive: залипание в телефоне, прокрастинация, бесцельное время
 
+О пользователе: разработчица, делает Telegram-ботов и проект ELGE (сайт недвижимости).
+Работа над ботом, кодом, ELGE, дизайном — это productive.
+
+ТЕКСТ — РАСШИФРОВКА ГОЛОСА, в нём бывают искажённые слова.
+- Если слово явно искажено и по контексту понятно, что имелось в виду (например «занималась батом» после разговора о делах = «ботом»), исправь.
+- Если слово непонятно — НЕ придумывай смысл. Оставь его в названии как есть и поставь utility "routine".
+
 Верни JSON строго в этом формате:
 {{
   "activities": [
@@ -34,11 +41,15 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
   ],
   "tasks_to_add": ["Позвонить маме"],
   "habit_identified": null,
+  "reminders": [{{"text": "Выпить витамины", "time": "10:00"}}],
   "encouragement": "Мотивирующая фраза на русском"
 }}
 
 tasks_to_add — список СТРОК (только текст задачи), пустой список, если планов нет.
 habit_identified — строка с названием привычки или null.
+reminders — только если пользователь ПРОСИТ регулярно напоминать («напоминай мне…», «надо бы мне напоминать…»).
+  text — короткое действие в инфинитиве («Выпить витамины»); time — "ЧЧ:ММ", если время названо, иначе null.
+  Такое действие НЕ дублируй в tasks_to_add. Если просьб о напоминаниях нет — пустой список.
 
 Замени дату на {today_date}. Никакого текста кроме JSON."""
 
@@ -132,6 +143,7 @@ async def parse_voice_text(text: str) -> dict:
             "activities": [],
             "tasks_to_add": [],
             "habit_identified": None,
+            "reminders": [],
             "encouragement": "Слышу тебя! Что-то пошло не так с анализом, попробуй ещё раз через минуту."
         }
 
@@ -147,6 +159,7 @@ async def parse_voice_text(text: str) -> dict:
             "activities": [],
             "tasks_to_add": [],
             "habit_identified": None,
+            "reminders": [],
             "encouragement": "Получила твоё сообщение! Попробуй ещё раз — иногда нужна пара попыток 🙂"
         }
 
@@ -166,8 +179,28 @@ async def parse_voice_text(text: str) -> dict:
     # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
     data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
+    data["reminders"] = _clean_reminders(data.get("reminders"))
 
     return data
+
+
+def _clean_reminders(raw) -> list:
+    """Оставляет только [{text, time}] с time формата ЧЧ:ММ или None."""
+    result = []
+    for item in raw or []:
+        if isinstance(item, str):
+            item = {"text": item, "time": None}
+        if not isinstance(item, dict):
+            continue
+        text = _as_text(item)
+        if not text:
+            continue
+        text = text[0].upper() + text[1:]
+        time = item.get("time")
+        m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", str(time).strip()) if time else None
+        time = f"{int(m.group(1)):02d}:{m.group(2)}" if m and int(m.group(1)) < 24 and int(m.group(2)) < 60 else None
+        result.append({"text": text, "time": time})
+    return result
 
 
 def _as_text(value) -> str:
