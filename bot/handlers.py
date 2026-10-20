@@ -1,5 +1,6 @@
 ﻿import os
 import re
+import json
 import time
 import secrets
 import pytz
@@ -16,7 +17,8 @@ import config
 from database import db_manager
 from services import google_oauth
 from services.stt import transcribe_audio
-from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES
+import groq
+from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES, PRIMARY_MODEL, QUOTA as ai_quota
 from services.calendar_api import add_event, build_event
 
 router = Router()
@@ -38,6 +40,7 @@ BOT_COMMANDS = [
 ]
 ADMIN_COMMANDS = BOT_COMMANDS + [
     ("users", "Кто пользуется ботом"),
+    ("feedback", "Где бот ошибся (👎 от пользователей)"),
     ("backup", "Копия базы"),
 ]
 
@@ -155,8 +158,8 @@ async def process_access(callback: types.CallbackQuery):
     await callback.message.edit_text(f"{'✅ Доступ открыт' if allow else '🚫 Доступ закрыт'}: {name}")
     try:
         if allow:
-            profile = await db_manager.get_or_create_profile(uid, _now_local().strftime("%Y-%m-%d"))
-            await callback.bot.send_message(uid, "🎉 Доступ открыт!\n\n" + welcome_text(uid, profile))
+            await db_manager.get_or_create_profile(uid, _now_local().strftime("%Y-%m-%d"))
+            await start_onboarding(callback.bot, uid, "🎉 Доступ открыт! Давай за минуту настроим бота.\n\n")
         else:
             await callback.bot.send_message(uid, "Владелец бота закрыл доступ.")
     except Exception as e:
@@ -217,11 +220,66 @@ def welcome_text(user_id: int, profile: dict) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
-    if not check_auth(message.from_user.id):
+    uid = message.from_user.id
+    if not check_auth(uid):
         await request_access(message)
         return
-    profile = await db_manager.get_or_create_profile(message.from_user.id, _now_local().strftime("%Y-%m-%d"))
-    await message.answer(welcome_text(message.from_user.id, profile))
+    profile = await db_manager.get_or_create_profile(uid, _now_local().strftime("%Y-%m-%d"))
+    # Пущенные до появления знакомства и ещё ничего не рассказавшие о себе — проходят его сейчас
+    if not is_admin(uid) and not await db_manager.get_setting(uid, "onboarding") \
+            and not await db_manager.get_setting(uid, "about") and not await db_manager.get_last_entry(uid):
+        await start_onboarding(message.bot, uid, "Привет! Давай за минуту настроим бота.\n\n")
+        return
+    await message.answer(welcome_text(uid, profile))
+
+
+# ---------- Знакомство: 3 шага после «Пустить» ----------
+
+ONB_STEP1 = ("Шаг 1 из 3. Расскажи о себе одной фразой — так я лучше расслышу голосовые и пойму, что для тебя "
+             "полезно. Например: «учусь на дизайнера, хожу в зал, работаю бариста».\n\n"
+             "Можно текстом или голосом.")
+ONB_STEP2 = ("Шаг 2 из 3. Теперь запиши кусочек дня — голосовым или текстом. Например:\n"
+             "«с 10 до 13 учёба, потом час в телефоне»\n"
+             "Время можно не называть — прикину сам и помечу «≈».")
+ONB_STEP3 = ("Шаг 3 из 3 ✅ Получилось! Что ещё умею:\n"
+             "• напоминания — «завтра в 10 созвон», «напоминай каждый день пить витамины»;\n"
+             "• вопросы — «что у меня сегодня?»;\n"
+             "• поправки — «нет, это было с 9 до 10»;\n"
+             "• итоги дня — /summary, разбор ритма — /plan (через пару дней записей).\n\n"
+             "📅 Хочешь, чтобы дела появлялись в твоём Google Календаре — /calendar.\n"
+             "Если я ошибся — жми «👎 Бот ошибся» под ответом. Все команды — /start.")
+
+
+async def start_onboarding(bot, user_id: int, intro: str):
+    await db_manager.set_setting(user_id, "onboarding", "about")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Пропустить", callback_data="onb_skip")
+    await _notify_markup(bot, user_id, intro + ONB_STEP1, builder.as_markup())
+
+
+async def _notify_markup(bot, user_id: int, text: str, markup):
+    try:
+        await bot.send_message(user_id, text, reply_markup=markup)
+    except Exception as e:
+        print(f"[notify] {user_id}: {e}")
+
+
+@router.callback_query(F.data == "onb_skip")
+async def process_onboarding_skip(callback: types.CallbackQuery):
+    if await db_manager.get_setting(callback.from_user.id, "onboarding") == "about":
+        await db_manager.set_setting(callback.from_user.id, "onboarding", "first_entry")
+    await callback.answer()
+    await callback.message.edit_text(ONB_STEP2)
+
+
+async def onboarding_about(message: types.Message, about_text: str) -> bool:
+    """Шаг 1: если ждём «о себе» — сохраняем и переходим к шагу 2. True — сообщение обработано."""
+    if await db_manager.get_setting(message.from_user.id, "onboarding") != "about":
+        return False
+    await db_manager.set_setting(message.from_user.id, "about", about_text.strip()[:500])
+    await db_manager.set_setting(message.from_user.id, "onboarding", "first_entry")
+    await message.answer(f"Запомнил ✅\n\n{ONB_STEP2}")
+    return True
 
 
 @router.message(Command("about"))
@@ -830,9 +888,21 @@ async def handle_voice(message: types.Message):
 
     try:
         about = await db_manager.get_setting(message.from_user.id, "about", "")
-        transcript = await transcribe_audio(temp_path, about)
+        try:
+            transcript = await transcribe_audio(temp_path, about)
+        except groq.RateLimitError as e:
+            day = "per day" in str(e).lower()
+            await status_msg.edit_text(
+                "⏳ Закончился бесплатный лимит распознавания голоса на сегодня — до завтра пиши текстом, пожалуйста."
+                if day else "⏳ Распознаванию голоса нужна передышка (лимит в минуту). Пришли ещё раз через пару минут "
+                            "или напиши текстом.")
+            await quota_watch(message.bot, "day" if day else None)
+            return
         if not transcript.strip():
             await status_msg.edit_text("Не удалось распознать слова в аудиосообщении.")
+            return
+        if await onboarding_about(message, transcript):
+            await status_msg.edit_text(f"«{transcript}»")
             return
         await process_entry(message, status_msg, transcript)
     finally:
@@ -845,6 +915,17 @@ async def handle_text(message: types.Message):
     """То же, что голосовое, только без расшифровки."""
     if not check_auth(message.from_user.id):
         await deny(message)
+        return
+    # Ответ (reply) на «что было не так?» — это комментарий к 👎, а не запись дня
+    reply_to = message.reply_to_message
+    if reply_to and reply_to.from_user and reply_to.from_user.is_bot:
+        feedback_id = await db_manager.add_feedback_comment(message.from_user.id, reply_to.message_id, message.text.strip())
+        if feedback_id:
+            await message.answer("Записал, спасибо! 🙏 Это поможет починить бота.")
+            await _notify_admins(message.bot, message.from_user,
+                                 f"💬 Комментарий к ошибке #{feedback_id}: {message.text.strip()}")
+            return
+    if await onboarding_about(message, message.text):
         return
     status_msg = await message.reply("Разбираю...")
     await process_entry(message, status_msg, message.text.strip())
@@ -1039,6 +1120,11 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         known_titles = [row[0] for row in await db_manager.get_top_patterns(user_id)][:60]
         context = await build_context(user_id, now)
         analysis = await parse_voice_text(transcript, known_titles, about, context)
+        await quota_watch(message.bot, analysis.get("rate_limited"))
+        if analysis.get("rate_limited"):
+            # Ничего не разобрано — не «👎», а просто честное «лимит, попробуй позже»
+            await status_msg.edit_text(f"«{transcript}»\n\n{analysis['answer']}")
+            return
 
         lines = [f"«{transcript}»\n"]
         created = {"a": [], "t": [], "r": [], "summary": []}
@@ -1060,7 +1146,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             elif not edit_lines:
                 lines.append("Не нашёл здесь дел, задач или напоминаний. Расскажи, что было, "
                              "или спроси, например: «что у меня сегодня?»")
-            await status_msg.edit_text(_join(lines))
+            await status_msg.edit_text(_join(lines), reply_markup=_feedback_only())
             return
 
         # 3. Дела. Календарь: свой Google человека (/calendar) — сразу; у владельца без /calendar —
@@ -1202,14 +1288,103 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         if created["a"] or created["t"] or created["r"]:
             entry_id = await db_manager.add_entry(user_id, transcript, created, now.replace(tzinfo=None).isoformat())
             builder.button(text="↩️ Отменить запись", callback_data=f"undo2_{entry_id}")
+        builder.button(text=FEEDBACK_LABEL, callback_data="fb")
         builder.adjust(1)
-        markup = builder.as_markup() if list(builder.buttons) else None
-        await status_msg.edit_text(_join(lines), reply_markup=markup)
+        await status_msg.edit_text(_join(lines), reply_markup=builder.as_markup())
+
+        # Знакомство: первая настоящая запись — шаг 3
+        if (created["a"] or created["t"] or created["r"]) and \
+                await db_manager.get_setting(user_id, "onboarding") == "first_entry":
+            await db_manager.set_setting(user_id, "onboarding", "done")
+            await message.answer(ONB_STEP3)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         await status_msg.edit_text(f"Ошибка обработки: {str(e)[:200]}")
+
+
+# ---------- Квота бесплатного Groq ----------
+
+QUOTA_WARN_SHARE = 0.1  # предупредить владельца, когда осталось меньше 10% дневных запросов
+
+
+async def quota_watch(bot, rate_limited: str | None = None):
+    """Раз в день предупредить владельца: квота на исходе / уже кончилась."""
+    owner = config.OWNER_ID
+    if not owner:
+        return
+    today = _now_local().strftime("%Y-%m-%d")
+    if rate_limited == "day" and await db_manager.get_setting(owner, "quota_out") != today:
+        await db_manager.set_setting(owner, "quota_out", today)
+        await _notify(bot, owner, "⛔ Бесплатный дневной лимит Groq закончился: бот до завтра не разбирает сообщения "
+                                  "(команды работают). Если так будет часто — можно уменьшить DAILY_ENTRY_LIMIT или "
+                                  "перейти на платный тариф Groq.")
+        return
+    quota = ai_quota.get(PRIMARY_MODEL)
+    if quota and quota["limit"] and quota["left"] / quota["limit"] < QUOTA_WARN_SHARE \
+            and await db_manager.get_setting(owner, "quota_low") != today:
+        await db_manager.set_setting(owner, "quota_low", today)
+        await _notify(bot, owner, f"⚠️ Квота Groq на исходе: осталось {quota['left']} из {quota['limit']} запросов "
+                                  "на сегодня. Когда кончится, бот будет отвечать «лимит исчерпан» до завтра.")
+
+
+# ---------- «👎 Бот ошибся» ----------
+
+FEEDBACK_LABEL = "👎 Бот ошибся"
+
+
+def _feedback_only():
+    builder = InlineKeyboardBuilder()
+    builder.button(text=FEEDBACK_LABEL, callback_data="fb")
+    return builder.as_markup()
+
+
+async def _notify_admins(bot, user, text: str):
+    who = user.full_name + (f" (@{user.username})" if user.username else "")
+    for admin_id in config.ALLOWED_USER_IDS:
+        if admin_id != user.id:
+            await _notify(bot, admin_id, f"{text}\n— {who}")
+
+
+@router.callback_query(F.data == "fb")
+async def process_feedback(callback: types.CallbackQuery):
+    bot_text = callback.message.text or ""
+    feedback_id = await db_manager.add_feedback(callback.from_user.id, bot_text)
+    await callback.answer("Спасибо, записал!")
+    # Кнопку убираем, остальные (например «Отменить») оставляем
+    markup = callback.message.reply_markup
+    if markup:
+        rows = [[b for b in row if b.callback_data != "fb"] for row in markup.inline_keyboard]
+        rows = [row for row in rows if row]
+        await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+    prompt = await callback.message.answer(
+        "Спасибо, что отметил(а)! Что было не так? Ответь на это сообщение (свайп влево → «Ответить») — "
+        "одной фразой: «время не то», «это был вопрос», «не то название»… Можно и не отвечать.")
+    await db_manager.set_feedback_prompt(feedback_id, prompt.message_id)
+    await _notify_admins(callback.bot, callback.from_user, f"👎 Ошибка #{feedback_id}:\n\n{bot_text[:3000]}")
+
+
+@router.message(Command("feedback"))
+async def cmd_feedback(message: types.Message):
+    """Админу: последние ошибки списком + все файлом (из него пополняется tests/eval_phrases.py)."""
+    if not is_admin(message.from_user.id):
+        return
+    rows = await db_manager.list_feedback(200)
+    if not rows:
+        await message.answer("Пока никто не нажимал «👎 Бот ошибся».")
+        return
+    text = "👎 Последние ошибки:\n\n"
+    for f_id, _, name, bot_text, comment, created in rows[:10]:
+        first = (bot_text or "").split("\n")[0][:120]
+        text += f"#{f_id} · {created[:16]} · {name or 'я'}\n{first}\n" + (f"💬 {comment}\n" if comment else "") + "\n"
+    await message.answer(text[:4000])
+    data = [{"id": f_id, "user": name, "created": created, "bot_text": bot_text, "comment": comment}
+            for f_id, _, name, bot_text, comment, created in rows]
+    await message.answer_document(
+        BufferedInputFile(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                          filename=f"feedback_{_now_local().strftime('%Y-%m-%d')}.json"),
+        caption="Все отметки файлом — пришли его Claude, чтобы добавить эти фразы в проверку бота.")
 
 
 @router.callback_query(F.data.startswith("undo2_"))

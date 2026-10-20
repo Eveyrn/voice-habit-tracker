@@ -2,6 +2,8 @@ import json
 import math
 import re
 import asyncio
+import time
+import groq
 import pytz
 from datetime import datetime, timedelta
 from groq import Groq
@@ -130,6 +132,33 @@ encouragement — одна короткая живая фраза, только 
 Никакого текста кроме JSON."""
 
 
+# Бесплатный Groq: ~1000 запросов в день и ~8000 токенов в минуту на каждую модель.
+# QUOTA — что осталось по последнему ответу; LIMIT_HIT — во что упёрлись последний раз («day» / «minute»).
+QUOTA: dict = {}
+LIMIT_HIT: dict = {"kind": None, "at": 0.0}
+
+
+def _remember_quota(model: str, headers):
+    try:
+        QUOTA[model] = {"left": int(headers.get("x-ratelimit-remaining-requests")),
+                        "limit": int(headers.get("x-ratelimit-limit-requests"))}
+    except (TypeError, ValueError):
+        pass
+
+
+def _remember_limit(error: Exception):
+    text = str(error).lower()
+    LIMIT_HIT["kind"] = "day" if ("per day" in text or "rpd" in text or "tpd" in text) else "minute"
+    LIMIT_HIT["at"] = time.time()
+
+
+def limit_answer() -> str:
+    if LIMIT_HIT["kind"] == "day":
+        return ("⏳ На сегодня закончился бесплатный лимит нейросети — разбирать сообщения смогу завтра. "
+                "Команды /summary, /todo, /reminders работают и сейчас.")
+    return "⏳ Нейросеть просит передышку (бесплатный лимит в минуту). Пришли это ещё раз через пару минут."
+
+
 def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str:
     """Синхронный вызов Groq API (будет запущен в отдельном потоке)."""
     kwargs = {
@@ -143,7 +172,9 @@ def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str
     if use_json_format:
         kwargs["response_format"] = {"type": "json_object"}
 
-    response = groq_client.chat.completions.create(**kwargs)
+    raw = groq_client.chat.completions.with_raw_response.create(**kwargs)
+    _remember_quota(model, raw.headers)
+    response = raw.parse()
     content = response.choices[0].message.content
     if not content or not content.strip():
         raise ValueError("модель вернула пустой ответ")
@@ -252,11 +283,19 @@ EMPTY_RESULT = {
 
 async def _ask(messages: list):
     """Сырой ответ модели: основная с json_object → основная без него → резервная. None, если все упали."""
+    limited_models = set()
     for model, as_json in ((PRIMARY_MODEL, True), (PRIMARY_MODEL, False), (FALLBACK_MODEL, False)):
+        if model in limited_models:
+            continue  # упёрлись в лимит этой модели — сразу к запасной (у неё свой лимит)
         try:
             raw = await asyncio.to_thread(_call_groq, model, messages, as_json)
             print(f"[ai_parser] {model}{'' if as_json else ' (без json)'} ответил: {raw[:200]}")
+            LIMIT_HIT["kind"] = None
             return raw
+        except groq.RateLimitError as e:
+            print(f"[ai_parser] {model}: лимит Groq: {e}")
+            _remember_limit(e)
+            limited_models.add(model)
         except Exception as e:
             print(f"[ai_parser] {model}{'' if as_json else ' (без json)'} упал: {e}")
     return None
@@ -327,6 +366,8 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
     raw = await _ask(messages)
     if raw is None:
         print("[ai_parser] Все модели упали, возвращаю заглушку.")
+        if LIMIT_HIT["kind"]:
+            return {**EMPTY_RESULT, "intent": "chat", "answer": limit_answer(), "rate_limited": LIMIT_HIT["kind"]}
         return {**EMPTY_RESULT, "intent": "chat",
                 "answer": "Не получилось разобрать — модель сейчас недоступна. Попробуй ещё раз через минуту."}
     data = _load(raw)

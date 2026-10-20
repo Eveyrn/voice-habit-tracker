@@ -121,6 +121,17 @@ async def init_db():
                 connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # «👎 Бот ошибся»: сообщение и ответ бота целиком + комментарий — из них пополняется tests/eval_phrases.py
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                bot_text TEXT,
+                comment TEXT,
+                prompt_message_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         # Записи (одно сообщение = одна запись): что из него создано — для «Отменить» и для поправок
         await db.execute('''
             CREATE TABLE IF NOT EXISTS entries (
@@ -560,6 +571,39 @@ async def get_last_entry(user_id):
         async with db.execute('SELECT id, text, data, created_at FROM entries WHERE user_id = ? ORDER BY id DESC LIMIT 1', (user_id,)) as cursor:
             row = await cursor.fetchone()
     return (row[0], row[1], json.loads(row[2] or "{}"), row[3]) if row else None
+
+# ---------- «Бот ошибся» ----------
+
+async def add_feedback(user_id, bot_text):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute('INSERT INTO feedback (user_id, bot_text) VALUES (?, ?)', (user_id, bot_text))
+        await db.commit()
+        return cursor.lastrowid
+
+async def set_feedback_prompt(feedback_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE feedback SET prompt_message_id = ? WHERE id = ?', (message_id, feedback_id))
+        await db.commit()
+
+async def add_feedback_comment(user_id, prompt_message_id, comment):
+    """Комментарий — ответ (reply) на сообщение «что не так?». Возвращает id отзыва или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id FROM feedback WHERE user_id = ? AND prompt_message_id = ?', (user_id, prompt_message_id)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        await db.execute('UPDATE feedback SET comment = ? WHERE id = ?', (comment, row[0]))
+        await db.commit()
+        return row[0]
+
+async def list_feedback(limit=50):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT f.id, f.user_id, COALESCE(u.name, ''), f.bot_text, f.comment, f.created_at
+            FROM feedback f LEFT JOIN users u ON u.user_id = f.user_id
+            ORDER BY f.id DESC LIMIT ?
+        ''', (limit,)) as cursor:
+            return await cursor.fetchall()
 
 # ---------- Пользователи ----------
 
