@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import asyncio
 import pytz
@@ -25,6 +26,8 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
 - "log" — рассказ о том, что делал(а), и/или планы, задачи, просьбы напомнить.
 - "question" — вопрос про свой день, планы, задачи, напоминания («что у нас сегодня?», «во сколько я к маме?»,
   «сколько я сидела в телефоне?»). Ответь в "answer" по ДАННЫМ выше, коротко и по делу, без выдумок.
+  Данные есть ТОЛЬКО за дни, перечисленные выше. Если спрашивают про период шире («за неделю», «за месяц») —
+  посчитай по тем дням, что есть, и прямо назови их («записи есть только за сегодня и вчера: …»).
   Если в данных ответа нет — так и скажи. Ничего не создавай.
 - "correction" — поправка к тому, что уже записано или создано («не каждый день, только сегодня»,
   «нет, я играла до 11», «удали это напоминание»). Опиши изменения в "edits", коротко подтверди в "answer".
@@ -44,12 +47,13 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
       "utility": "productive",
       "duration_minutes": 60,
       "start_time": "{today_date}T08:00:00",
-      "end_time": "{today_date}T09:00:00"
+      "end_time": "{today_date}T09:00:00",
+      "time_exact": true
     }}
   ],
   "tasks_to_add": ["Купить корм коту"],
   "habit_identified": null,
-  "reminders": [{{"text": "В 15:00 быть у мамы", "time": "14:30", "repeat": "once", "date": "{today_date}"}}],
+  "reminders": [{{"text": "Быть у мамы", "time": "15:00", "repeat": "once", "date": "{today_date}", "kind": "event"}}],
   "edits": [{{"op": "reminder_once", "id": 12, "date": "{today_date}"}}],
   "encouragement": ""
 }}
@@ -66,17 +70,27 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
 - ВРЕМЯ. Названо — используй. Если в данных есть связанное событие со временем (напоминание «В 15:00 быть у мамы»,
   а пользователь пишет «встретилась с мамой») — опирайся на него: с 15:00 до сейчас. Если времени нет совсем —
   выстрой дела подряд так, чтобы последнее закончилось сейчас ({current_time}). Ничего не ставь в будущее.
+  Дату ставь настоящую: «вчера вечером» — вчерашняя дата.
+- Относительное время считай от «сейчас» ({current_time}): «час назад закончила, шла полтора часа» →
+  end_time = сейчас − 60 мин, start_time = end_time − 90 мин, duration_minutes = 90.
+- time_exact: true — только если время или длительность пользователь назвал сам («с 8 до 10», «час назад,
+  полтора часа»); false — если ты его прикинул («утром ходила в зал», «поела»).
 - В массиве — по порядку времени.
 
 ЗАДАЧИ (tasks_to_add) — дела на будущее БЕЗ конкретного времени («купить корм коту»). Список строк.
-habit_identified — строка с названием привычки или null.
+
+ПРИВЫЧКИ. habit_identified — если пользователь сделал то, о чём у него есть ЕЖЕДНЕВНОЕ напоминание в ДАННЫХ
+(«выпила витамины» ↔ напоминание «Выпить витамины»), впиши ТОЧНО текст этого напоминания. Иначе null.
+Такое короткое действие (витамины, таблетки, стакан воды) в activities НЕ добавляй.
 
 НАПОМИНАНИЯ (reminders):
-- Разовое: repeat "once", date — дата события. Это любые планы с временем на сегодня/завтра/дату
-  («сегодня к 3 быть у мамы», «завтра в 10 созвон»). Если это встреча или «к такому-то часу» — time на 30 минут
-  РАНЬШЕ, а время события впиши в text: «В 15:00 быть у мамы».
-- Ежедневное: repeat "daily", date null — ТОЛЬКО если явно просят регулярно («каждый день», «каждое утро»,
-  «напоминай мне пить витамины»).
+- Разовое: repeat "once", date — дата. Это любые планы с временем на сегодня/завтра/дату.
+  kind "event" — встреча или дело в своё время («сегодня к 3 быть у мамы», «завтра в 9 к врачу», «в 10 созвон»):
+  time — время САМОГО события, text — без времени («Быть у мамы»). Бот сам напомнит заранее.
+  kind "reminder" — человек просит напомнить именно в этот момент («напомни в 15:00 позвонить маме»): time — этот момент.
+- Ежедневное: repeat "daily", date null, kind "reminder" — ТОЛЬКО если явно просят регулярно («каждый день»,
+  «каждое утро», «напоминай мне пить витамины»). text — без времени («Читать»).
+- Время всегда в 24-часовом формате: «в 10 вечера», «каждый вечер в 10» → "22:00"; «в 3 дня» → "15:00".
 - После еды: repeat "daily", time "meal".
 - Время не названо и непонятно — time null.
 - Что попало в reminders, НЕ дублируй в tasks_to_add.
@@ -90,6 +104,7 @@ habit_identified — строка с названием привычки или 
 - {{"op": "activity_delete", "id": N}}
 - {{"op": "task_delete", "id": N}}
 
+answer для intent "log" — "" (бот сам перечислит, что записал), если только в сообщении нет ещё и вопроса.
 encouragement — одна короткая живая фраза, только для intent "log"; для остальных "". Без пафоса и банальностей.
 
 ТЕКСТ БЫВАЕТ РАСШИФРОВКОЙ ГОЛОСА, в нём встречаются искажённые слова.
@@ -168,8 +183,11 @@ FIRST_DAYS_PROMPT = """Ты — спокойный коуч по распоря�
 
 
 def _fmt_hour(hours: list) -> str:
-    avg = sum(hours) / len(hours)
-    return f"{int(avg):02d}:{int(round(avg % 1 * 60)) % 60:02d}"
+    """Среднее время по кругу суток: 23:00 и 01:00 → 00:00, а не 12:00, как дало бы обычное среднее."""
+    angles = [h / 24 * 2 * math.pi for h in hours]
+    avg = math.atan2(sum(math.sin(a) for a in angles), sum(math.cos(a) for a in angles)) / (2 * math.pi) * 24 % 24
+    minutes = int(round(avg * 60)) % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 async def analyze_rhythm(stats: dict, days: int, about: str = "", period: int = 21) -> str:
@@ -314,7 +332,7 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
     data["activities"].sort(key=lambda a: str(a.get("start_time") or ""))
     data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
-    data["reminders"] = _clean_reminders(data.get("reminders"), today_date)
+    data["reminders"] = _clean_reminders(data.get("reminders"), today_date, text)
     data["edits"] = _clean_edits(data.get("edits"))
     data["intent"] = data["intent"] if data["intent"] in ("log", "question", "correction", "chat") else "log"
     data["answer"] = _as_text(data.get("answer")).replace("**", "")
@@ -332,7 +350,20 @@ def _clean_date(value):
     return value if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else None
 
 
-def _clean_reminders(raw, today_date) -> list:
+EVENING_RE = re.compile(r"вечер", re.I)
+MORNING_RE = re.compile(r"утр", re.I)
+
+
+def _evening_fix(time, source_text):
+    """«Каждый вечер в 10» модель иногда отдаёт как 10:00. Если речь о вечере, а не об утре, — переводим в 22:00."""
+    if time and time != "meal" and EVENING_RE.search(source_text or "") and not MORNING_RE.search(source_text or ""):
+        hour, minute = map(int, time.split(":"))
+        if 1 <= hour <= 11:
+            return f"{hour + 12:02d}:{minute:02d}"
+    return time
+
+
+def _clean_reminders(raw, today_date, source_text="") -> list:
     """[{text, time, date}]: time — ЧЧ:ММ, 'meal' или None; date — ГГГГ-ММ-ДД для разовых, None для ежедневных."""
     result = []
     for item in raw or []:
@@ -344,10 +375,23 @@ def _clean_reminders(raw, today_date) -> list:
         if not text:
             continue
         time = "meal" if str(item.get("time")).strip().lower() == "meal" else _clean_time(item.get("time"))
+        time = _evening_fix(time, source_text)
         once = str(item.get("repeat", "")).lower() == "once" and time != "meal"
         date = (_clean_date(item.get("date")) or today_date) if once else None
+        # Время в тексте («В 22:00 читать») модель иногда дописывает сама — убираем, бот добавит его, где нужно
+        text = TIME_PREFIX_RE.sub("", text).strip() or text
+        if once and time and str(item.get("kind", "")).lower() == "event":
+            # Встреча: напоминаем за 30 минут, а время события пишем в текст
+            event_at = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+            remind_at = event_at - timedelta(minutes=EVENT_LEAD_MIN)
+            text = f"В {time} {text[0].lower() + text[1:]}"
+            date, time = remind_at.strftime("%Y-%m-%d"), remind_at.strftime("%H:%M")
         result.append({"text": text[0].upper() + text[1:], "time": time, "date": date})
     return result
+
+
+TIME_PREFIX_RE = re.compile(r"^(в|к)\s*\d{1,2}[:.]\d{2}\s*[—–-]?\s*", re.I)
+EVENT_LEAD_MIN = 30
 
 
 EDIT_OPS = {"reminder_once", "reminder_daily", "reminder_time", "reminder_delete",

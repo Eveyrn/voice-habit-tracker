@@ -525,6 +525,16 @@ async def delete_google(user_id):
         await db.execute('DELETE FROM google_calendars WHERE user_id = ?', (user_id,))
         await db.commit()
 
+async def get_daily_totals(user_id, since_date):
+    """[(дата, категория, минут)] по дням начиная с since_date — для ответов на «сколько за неделю»."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT substr(start_time, 1, 10) AS day, category, SUM(duration_min) FROM activities
+            WHERE user_id = ? AND substr(start_time, 1, 10) >= ?
+            GROUP BY day, category ORDER BY day
+        ''', (user_id, since_date)) as cursor:
+            return await cursor.fetchall()
+
 async def get_task(task_id, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT id, title FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id)) as cursor:

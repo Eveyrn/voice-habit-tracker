@@ -45,7 +45,6 @@ async def morning_checkin(bot: Bot):
         await send_to(bot, user_id,
                       "☀️ Доброе утро!\n\n"
                       f"{plans_text}"
-                      f"🕵️ Наблюдение: день {profile['days_passed']} из {profile['target_days']}.\n"
                       "Какие планы на первую половину дня? Запиши голосовое или набросай задачи!")
 
 

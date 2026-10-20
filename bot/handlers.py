@@ -193,9 +193,8 @@ def welcome_text(user_id: int, profile: dict) -> str:
         "«С 14 до 18 работа, потом час сериала»\n"
         "«Завтра в 10 созвон», «Напоминай каждый день пить витамины»\n"
         "А ещё можно спрашивать: «что у меня сегодня?» — и поправлять: «нет, игра была до 11».\n\n"
-        f"🕵️ Режим наблюдения: день {profile['days_passed']} из {profile['target_days']}. "
-        "Я собираю статистику твоего ритма; разбор и предложение расписания — по /plan "
-        "(точнее всего через 1–3 недели записей).\n\n"
+        "🧭 Из записей я собираю статистику твоего ритма: разбор и предложение расписания — по /plan. "
+        "Первые выводы — после 3 дней записей, точнее всего — через 1–2 недели.\n\n"
     )
     text += ("📅 /calendar — подключить свой Google Календарь: дела будут появляться в нём "
              "(и на телефоне — Samsung, Redmi, iPhone).\n\n")
@@ -700,7 +699,7 @@ async def cmd_patterns(message: types.Message):
     profile = await db_manager.get_or_create_profile(message.from_user.id, _now_local().strftime("%Y-%m-%d"))
     patterns = await db_manager.get_top_patterns(message.from_user.id)
 
-    header = f"🕵️ Наблюдение: день {profile['days_passed']} из {profile['target_days']}\n\n"
+    header = f"🗓 Ты с трекером {profile['days_passed']} {_days_word(profile['days_passed'])}\n\n"
     if not patterns:
         await message.answer(header + "Пока недостаточно данных. Продолжай рассказывать о своих делах!")
         return
@@ -869,6 +868,19 @@ async def build_context(user_id: int, now: datetime) -> str:
         lines.append("Записано вчера:")
         lines.extend(f"- {_hm(start)}–{_hm(end)} {title} ({duration} мин)" for _, title, _, _, duration, start, end in acts_y[-25:])
 
+    # Итоги по дням за неделю — чтобы на «сколько я за неделю…» модель считала по фактам и видела пустые дни
+    week_start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+    totals = {}
+    for day, category, minutes in await db_manager.get_daily_totals(user_id, week_start):
+        totals.setdefault(day, {})[category] = int(minutes or 0)
+    lines.append(f"Итоги по категориям за последние 7 дней (с {week_start}); дней с записями: {len(totals)}:")
+    if totals:
+        for day in sorted(totals):
+            parts = ", ".join(f"{c} {m} мин" for c, m in totals[day].items())
+            lines.append(f"- {day}: {parts}")
+    else:
+        lines.append("- записей нет")
+
     tasks = await db_manager.get_pending_tasks(user_id)
     if tasks:
         lines.append("Открытые задачи:")
@@ -952,6 +964,54 @@ async def apply_edits(user_id: int, edits: list, now: datetime) -> list[str]:
     return out
 
 
+PERIOD_RE = re.compile(r"недел|месяц|всего|в среднем|обычно|за все|за последн", re.I)
+
+
+async def period_note(user_id: int, now: datetime) -> str:
+    """Честная пометка к ответу про период: за какие дни на самом деле есть записи."""
+    since = (now - timedelta(days=29)).strftime("%Y-%m-%d")
+    days = sorted({row[0] for row in await db_manager.get_daily_totals(user_id, since)}, reverse=True)
+    if not days:
+        return "\nℹ️ Записей за этот период нет."
+    shown = ", ".join(datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m") for d in days[:10])
+    more = f" и ещё {len(days) - 10}" if len(days) > 10 else ""
+    return f"\nℹ️ Считаю по записям за {len(days)} {_days_word(len(days))}: {shown}{more}. За другие дни записей нет."
+
+
+def _parse_dt(value):
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", ""))
+        return dt.replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
+
+
+def _day_label(dt: datetime, now: datetime) -> str:
+    """Пусто для сегодня, иначе «вчера» / «21.10» — чтобы вчерашнее дело не выглядело сегодняшним."""
+    delta = (now.date() - dt.date()).days
+    if delta == 0:
+        return ""
+    if delta == 1:
+        return "вчера "
+    return f"{dt.strftime('%d.%m')} "
+
+
+def _stems(text: str) -> set:
+    return {w[:5] for w in re.findall(r"[а-яёa-z]+", text.lower()) if len(w) >= 4}
+
+
+def _match_habit(habit: str, daily: list):
+    """Ежедневное напоминание, к которому относится отмеченное действие («Витамины» ↔ «Выпить витамины»)."""
+    for r_id, r_text in daily:
+        if r_text.lower() == habit.lower():
+            return r_id, r_text
+    habit_stems = _stems(habit)
+    for r_id, r_text in daily:
+        if habit_stems & _stems(r_text):
+            return r_id, r_text
+    return None
+
+
 def _join(lines):
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -995,6 +1055,8 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             # После поправки строки «✏️ …» уже всё говорят — ответ модели был бы повтором
             if analysis["answer"] and not (edit_lines and analysis["intent"] == "correction"):
                 lines.append(("\n" if edit_lines else "") + analysis["answer"])
+                if analysis["intent"] == "question" and PERIOD_RE.search(transcript):
+                    lines.append(await period_note(user_id, now))
             elif not edit_lines:
                 lines.append("Не нашёл здесь дел, задач или напоминаний. Расскажи, что было, "
                              "или спроси, например: «что у меня сегодня?»")
@@ -1006,16 +1068,36 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         is_owner = user_id == config.OWNER_ID
         google = await db_manager.get_google(user_id) if google_oauth.enabled() else None
         legacy_calendar = not google and is_owner and profile["phase"] == "coaching"
-        calendar_ok, calendar_lost = True, False
+        calendar_ok, calendar_lost, any_approx = True, False, False
+        naive_now = now.replace(tzinfo=None)
         for act in activities:
             title = act.get("title") or "Дело"
             utility = act.get("utility") if act.get("utility") in UTILITY_LABEL else "routine"
             category = act.get("category", "Другое")
             start_time, end_time = act.get("start_time"), act.get("end_time")
-            try:
-                duration = int(act.get("duration_minutes") or 30)
-            except (TypeError, ValueError):
-                duration = 30
+            start_dt, end_dt = _parse_dt(start_time), _parse_dt(end_time)
+
+            # Будущее — это план, а не сделанное дело
+            if start_dt and start_dt > naive_now + timedelta(minutes=5):
+                lines.append(f"⏭ «{title}» ещё впереди — не записываю как сделанное. "
+                             "Напомнить? Скажи, например: «напомни в 18:00 …»")
+                continue
+
+            # Длительность — по времени, если оно есть: модель иногда пишет одно, а время ставит другое
+            if start_dt and end_dt and end_dt > start_dt:
+                duration = int((end_dt - start_dt).total_seconds() // 60)
+            else:
+                try:
+                    duration = max(1, int(act.get("duration_minutes") or 30))
+                except (TypeError, ValueError):
+                    duration = 30
+                # «20:46–20:46» или нет конца/начала — достраиваем интервал из длительности
+                if end_dt and (not start_dt or start_dt >= end_dt):
+                    start_dt = end_dt - timedelta(minutes=duration)
+                elif start_dt and not end_dt:
+                    end_dt = start_dt + timedelta(minutes=duration)
+                if start_dt and end_dt:
+                    start_time, end_time = start_dt.isoformat(), end_dt.isoformat()
 
             event_id = None
             description = f"Категория: {category} | Из трекера дня"
@@ -1036,10 +1118,17 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             await db_manager.record_pattern(user_id=user_id, title=title, utility=utility, date_str=today_date)
 
             time_label = f"{_hm(start_time)}–{_hm(end_time)} " if _hm(start_time) and _hm(end_time) else ""
-            lines.append(f"⏱ {time_label}{title} · {_fmt_min(duration)} · {UTILITY_LABEL[utility]}")
+            # Время прикинуто (пользователь его не называл) — показываем «≈», чтобы догадка не выглядела фактом
+            approx = "≈ " if time_label and act.get("time_exact") is False else ""
+            day_label = _day_label(start_dt, now) if start_dt else ""
+            lines.append(f"⏱ {day_label}{approx}{time_label}{title} · {_fmt_min(duration)} · {UTILITY_LABEL[utility]}")
+            if approx:
+                any_approx = True
             created["a"].append(activity_id)
             created["summary"].append(f"дело #{activity_id}: {time_label}{title}")
 
+        if any_approx:
+            lines.append("≈ — время прикинул сам. Если не так, поправь, например: «это было с 9 до 10»")
         if activities:
             if calendar_lost:
                 lines.append("⚠️ Доступ к Google Календарю отозван — подключи заново: /calendar")
@@ -1056,11 +1145,17 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
                 created["summary"].append(f"задача #{task_id}: {t}")
                 lines.append(f"- {t}")
 
-        # 5. Привычка
+        # 5. Привычка: привязываем к ежедневному напоминанию, иначе «Витамины» и «Выпить витамины» — разные
+        # привычки, отметка в итогах дня не появится, а напоминание всё равно придёт
         habit = analysis["habit_identified"]
         if habit:
+            daily = [(r_id, r_text) for r_id, r_text, _, r_date in await db_manager.get_reminders(user_id) if not r_date]
+            match = _match_habit(habit, daily)
+            if match:
+                habit = match[1]
+                await db_manager.mark_reminder_sent(match[0], today_date)  # сегодня уже сделано — не напоминать
             streak = await db_manager.update_habit(user_id, habit, today_date)
-            lines.append(f"\n🔥 Привычка: {habit} (серия: {streak} дн.)")
+            lines.append(f"\n✅ {habit} — отмечено (серия: {streak} дн.)")
 
         # 6. Напоминания
         for rem in analysis["reminders"]:
@@ -1081,13 +1176,16 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             created["r"].append(reminder_id)
             created["summary"].append(f"напоминание #{reminder_id}: {when} — {text}")
 
-        if analysis["answer"]:
+        # В рассказе ответ модели обычно пересказывает уже перечисленное («Записал напоминание…») —
+        # показываем его, только если в сообщении был ещё и вопрос
+        if analysis["answer"] and (analysis["intent"] != "log" or "?" in transcript):
             lines.append(f"\n{analysis['answer']}")
         if analysis["encouragement"]:
             lines.append(f"\n{analysis['encouragement']}")
 
         # Мягкий стоп-сигнал: один раз в день, когда телефон/игры перевалили за порог
-        if any(a.get("utility") == "unproductive" for a in activities):
+        # (только если залипание добавлено за СЕГОДНЯ — на запись про вчерашний сериал не реагируем)
+        if any(a.get("utility") == "unproductive" and str(a.get("start_time", "")).startswith(today_date) for a in activities):
             note = await phone_limit_note(user_id, today_date)
             if note:
                 lines.append(f"\n{note}")
