@@ -4,7 +4,6 @@ import datetime
 import pytz
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import config
 
@@ -21,27 +20,32 @@ COLOR_MAP = {
 
 _service_cache = None
 
+
+class CalendarUnavailable(Exception):
+    """Нет рабочего ключа Google — календарь пропускаем, бот работает дальше."""
+
+
 def get_calendar_service():
+    """Сервис календаря из token.json. Никогда не открывает браузер для входа:
+    на сервере это вешает бота навсегда. Вход делается локально: python auth_calendar.py"""
     global _service_cache
     if _service_cache is not None:
         return _service_cache
 
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    if not os.path.exists(TOKEN_FILE):
+        raise CalendarUnavailable("нет token.json — запусти локально auth_calendar.py")
+
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if not creds.valid:
+        if not creds.refresh_token:
+            raise CalendarUnavailable("в token.json нет refresh_token — войди заново через auth_calendar.py")
+        try:
             creds.refresh(Request())
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
-        else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(f"Файл {CREDENTIALS_FILE} не найден!")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
+        except Exception as e:
+            # invalid_grant: ключ отозван или истёк (у приложения в режиме «Тестирование» — через 7 дней)
+            raise CalendarUnavailable(f"ключ Google не обновился ({e}) — войди заново через auth_calendar.py")
+        with open(TOKEN_FILE, 'w') as token:
+            token.write(creds.to_json())
 
     _service_cache = build('calendar', 'v3', credentials=creds, cache_discovery=False)
     return _service_cache
@@ -101,6 +105,9 @@ def add_event(summary: str, start_time: str, end_time: str, utility: str = 'prod
 
         created_event = service.events().insert(calendarId='primary', body=event).execute()
         return created_event.get('htmlLink')
+    except CalendarUnavailable as e:
+        print(f"Календарь недоступен: {e}")
+        return None
     except Exception as e:
         print(f"Ошибка Google Calendar API: {e}")
         return None

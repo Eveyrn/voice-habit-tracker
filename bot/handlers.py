@@ -293,8 +293,9 @@ async def handle_voice(message: types.Message):
                     pass
 
             # КАЛЕНДАРЬ: если ещё идёт фаза наблюдения, события в календарь НЕ отправляются!
+            calendar_link = None
             if profile['phase'] == 'coaching':
-                await asyncio.to_thread(
+                calendar_link = await asyncio.to_thread(
                     add_event,
                     summary=title,
                     start_time=start_time,
@@ -322,7 +323,12 @@ async def handle_voice(message: types.Message):
             )
 
             icon = "🟢 Полезное" if utility == "productive" else ("⚪ Бытовое" if utility == "routine" else "🔴 Прокрастинация / Отдых")
-            sync_label = "Синхронизировано в Календарь" if profile['phase'] == 'coaching' else "Сохранено в профиль наблюдения (Календарь подключится через 3 нед.)"
+            if profile['phase'] != 'coaching':
+                sync_label = "Сохранено в профиль наблюдения (Календарь подключится через 3 нед.)"
+            elif calendar_link:
+                sync_label = "Синхронизировано в Календарь"
+            else:
+                sync_label = "Сохранено в боте (Календарь сейчас недоступен)"
             response_lines.append(f"⏱ {time_label}{title} ({duration} мин)\nКатегория: {icon}\n{sync_label}")
 
         # 4. To-Do
