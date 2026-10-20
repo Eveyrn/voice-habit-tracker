@@ -81,7 +81,7 @@ async def phone_limit_note(user_id: int, today_date: str):
     if spent < limit:
         return None
     await db_manager.set_setting(user_id, "phone_limit_warned", today_date)
-    return (f"🔴 Сегодня на телефон и залипание уже {_fmt_min(spent)} — это больше твоих {_fmt_min(limit)}. "
+    return (f"🔴 Сегодня на телефон и залипание уже {_fmt_min(spent)} (твой порог — {_fmt_min(limit)}). "
             "Без оценок, просто чтобы ты знала. Может, 10 минут пройтись или воды выпить?")
 
 
