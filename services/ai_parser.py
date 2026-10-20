@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 import pytz
 from datetime import datetime
@@ -6,11 +6,12 @@ from groq import Groq
 import config
 
 groq_client = Groq(api_key=config.GROQ_API_KEY)
-# Используем openai/gpt-oss-120b - у нее нет жесткого лимита 1000 токенов в минуту
-MODEL_NAME = "openai/gpt-oss-120b"
 
-SYSTEM_PROMPT = """
-Ты — ассистент по учету времени. Проанализируй рассказ пользователя и верни ТОЛЬКО JSON.
+# llama-3.3-70b-versatile — надёжная модель с хорошим JSON-выводом
+PRIMARY_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama3-8b-8192"
+
+SYSTEM_PROMPT = """Ты — ассистент по учету времени. Проанализируй рассказ пользователя и верни ТОЛЬКО валидный JSON без каких-либо пояснений, markdown-блоков или лишнего текста.
 
 Текущее время: {now_str}. Сегодня: {today_date}. Часовой пояс: {tz}.
 
@@ -20,27 +21,49 @@ SYSTEM_PROMPT = """
 - unproductive: залипание, прокрастинация.
 
 ПРАВИЛА ВРЕМЕНИ:
-- Если названы часы ('с 14:00 до 18:00'), ставь их точно: start_time: {today_date}T14:00:00, end_time: {today_date}T18:00:00.
-- Если действия шли подряд, продолжай цепочку (следующее начинается в конец предыдущего) вплоть до текущего момента ({current_time}).
+- Если названы часы ('с 14:00 до 18:00'), ставь их точно.
+- Если действия шли подряд, продолжай цепочку вплоть до текущего момента ({current_time}).
 - Не ставь накладывающиеся интервалы.
 
-ФОРМАТ JSON:
+ВЕРНИ ТОЛЬКО ЭТОТ JSON (без ```json, без пояснений):
 {{
   "activities": [
     {{
-      "title": "Работа",
-      "category": "Работа",
+      "title": "Название активности",
+      "category": "Категория",
       "utility": "productive",
-      "duration_minutes": 240,
+      "duration_minutes": 60,
       "start_time": "{today_date}T14:00:00",
-      "end_time": "{today_date}T18:00:00"
+      "end_time": "{today_date}T15:00:00"
     }}
   ],
   "tasks_to_add": [],
   "habit_identified": null,
-  "encouragement": "Отличная работа!"
-}}
-"""
+  "encouragement": "Мотивирующая фраза"
+}}"""
+
+
+def _clean_json(raw: str) -> str:
+    """Очищает ответ модели от markdown-блоков и лишнего текста."""
+    raw = raw.strip()
+    # Убираем ```json ... ``` блоки
+    raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    # Находим первый { и последний } — берём только JSON
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+    return raw
+
+
+def _build_messages(prompt: str, text: str) -> list:
+    return [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text}
+    ]
+
 
 async def parse_voice_text(text: str) -> dict:
     tz = pytz.timezone(config.TIMEZONE)
@@ -56,41 +79,65 @@ async def parse_voice_text(text: str) -> dict:
         tz=config.TIMEZONE
     )
 
+    raw_text = None
+
+    # Попытка 1 — основная модель без json_object (надёжнее)
     try:
         response = groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
+            model=PRIMARY_MODEL,
+            messages=_build_messages(prompt, text),
             temperature=0.1,
-            max_tokens=600,
-            response_format={"type": "json_object"}
+            max_tokens=800
         )
-        raw_text = response.choices[0].message.content.strip()
+        raw_text = response.choices[0].message.content
     except Exception as e:
-        # Резерв на быструю модель gpt-oss-20b
-        print(f"Fallback to gpt-oss-20b due to: {e}")
-        response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
-        raw_text = response.choices[0].message.content.strip()
+        print(f"[ai_parser] Основная модель ({PRIMARY_MODEL}) упала: {e}")
 
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
-        raw_text = re.sub(r"\n?```$", "", raw_text)
+    # Попытка 2 — резервная модель
+    if raw_text is None:
+        try:
+            response = groq_client.chat.completions.create(
+                model=FALLBACK_MODEL,
+                messages=_build_messages(prompt, text),
+                temperature=0.1,
+                max_tokens=600
+            )
+            raw_text = response.choices[0].message.content
+        except Exception as e:
+            print(f"[ai_parser] Резервная модель ({FALLBACK_MODEL}) тоже упала: {e}")
 
-    data = json.loads(raw_text.strip())
-    if "activities" not in data:
+    # Если обе модели упали — возвращаем заглушку
+    if raw_text is None:
+        return {
+            "activities": [],
+            "tasks_to_add": [],
+            "habit_identified": None,
+            "encouragement": "Не удалось разобрать сообщение, попробуй ещё раз."
+        }
+
+    # Парсим JSON
+    cleaned = _clean_json(raw_text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"[ai_parser] Не удалось распарсить JSON: {e}\nRaw: {raw_text[:300]}")
+        return {
+            "activities": [],
+            "tasks_to_add": [],
+            "habit_identified": None,
+            "encouragement": "Получила твоё сообщение, но не смогла разобрать детали. Попробуй ещё раз!"
+        }
+
+    # Гарантируем наличие ключей
+    data.setdefault("activities", [])
+    data.setdefault("tasks_to_add", [])
+    data.setdefault("habit_identified", None)
+    data.setdefault("encouragement", "")
+
+    # Если activities вложены в другой ключ
+    if not data["activities"]:
         for k, v in data.items():
             if isinstance(v, dict) and "activities" in v:
                 return v
-        data["activities"] = []
+
     return data
