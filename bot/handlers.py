@@ -88,6 +88,12 @@ async def cmd_backup(message: types.Message):
 
 TIME_RE = re.compile(r"^(\d{1,2})[:.](\d{2})$")
 
+# Напоминание «после еды» хранится с time = "meal": планировщик по часам его не трогает
+# ("meal" > "23:59" при сравнении строк), а срабатывает оно, когда в записи есть дело категории «Еда».
+MEAL = "meal"
+MEAL_RE = re.compile(r"после\s+(еды|едой|при[её]ма\s+пищи|завтрака|обеда|ужина|перекуса)|во\s+время\s+еды|когда\s+поем", re.I)
+PENDING_REMINDER = {}  # user_id -> текст напоминания, для которого ждём выбор времени
+
 
 def _now_local():
     return datetime.now(pytz.timezone(config.TIMEZONE))
@@ -109,20 +115,56 @@ async def cmd_remind(message: types.Message):
     if not check_auth(message.from_user.id):
         return
 
-    parts = (message.text or "").split(maxsplit=2)
-    m = TIME_RE.match(parts[1]) if len(parts) == 3 else None
-    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+    parts = (message.text or "").split(maxsplit=1)
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if not rest:
         await message.answer(
-            "Напиши время и что напомнить:\n"
-            "/remind 10:00 Выпить витамины\n\n"
+            "Напиши, что напомнить, и, если хочешь, время:\n"
+            "/remind 10:00 Выпить витамины\n"
+            "/remind Пить таблетки после еды\n\n"
             "Буду напоминать каждый день, а кнопка «✅ Сделала» отметит привычку."
         )
         return
 
-    time_str = f"{int(m.group(1)):02d}:{m.group(2)}"
-    text = parts[2].strip()
-    await save_reminder(message.from_user.id, text, time_str)
-    await message.answer(f"⏰ Буду напоминать каждый день в {time_str}: {text}")
+    first, _, tail = rest.partition(" ")
+    m = TIME_RE.match(first)
+    if m and tail.strip() and int(m.group(1)) <= 23 and int(m.group(2)) <= 59:
+        time_str = f"{int(m.group(1)):02d}:{m.group(2)}"
+        text = tail.strip()
+        await save_reminder(message.from_user.id, text, time_str)
+        await message.answer(f"⏰ Буду напоминать каждый день в {time_str}: {text}")
+        return
+
+    text = rest[0].upper() + rest[1:]
+    if MEAL_RE.search(text):
+        await save_reminder(message.from_user.id, text, MEAL)
+        await message.answer(f"🍽 Буду напоминать, как только запишешь еду: {text}")
+        return
+
+    # Времени нет — спрашиваем кнопками
+    PENDING_REMINDER[message.from_user.id] = text
+    builder = InlineKeyboardBuilder()
+    for t in ("08:00", "10:00", "13:00", "19:00", "22:00"):
+        builder.button(text=t, callback_data=f"remat_{t}")
+    builder.button(text="🍽 После еды", callback_data=f"remat_{MEAL}")
+    builder.adjust(5, 1)
+    await message.answer(
+        f"Когда напоминать «{text}»?\nИли напиши своё время: /remind 15:30 {text}",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("remat_"))
+async def process_reminder_time(callback: types.CallbackQuery):
+    when = callback.data.split("_", 1)[1]
+    text = PENDING_REMINDER.pop(callback.from_user.id, None)
+    if not text:
+        await callback.answer("Напиши /remind ещё раз")
+        return
+    await save_reminder(callback.from_user.id, text, when)
+    await callback.answer("Готово")
+    label = "как только запишешь еду" if when == MEAL else f"каждый день в {when}"
+    await callback.message.edit_text(f"⏰ Буду напоминать {label}: {text}")
 
 
 async def _reminders_view(user_id: int):
@@ -133,8 +175,9 @@ async def _reminders_view(user_id: int):
     builder = InlineKeyboardBuilder()
     text = "⏰ Ежедневные напоминания:\n\n"
     for r_id, r_text, r_time in reminders:
-        text += f"{r_time} — {r_text}\n"
-        builder.button(text=f"🗑 {r_time} {r_text[:20]}", callback_data=f"remdel_{r_id}")
+        when = "после еды" if r_time == MEAL else r_time
+        text += f"{when} — {r_text}\n"
+        builder.button(text=f"🗑 {when} {r_text[:20]}", callback_data=f"remdel_{r_id}")
     builder.adjust(1)
     return text, builder.as_markup()
 
@@ -435,6 +478,9 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             if rem["time"]:
                 await save_reminder(message.from_user.id, rem["text"], rem["time"])
                 response_lines.append(f"\n⏰ Буду напоминать каждый день в {rem['time']}: {rem['text']}")
+            elif MEAL_RE.search(rem["text"]):
+                await save_reminder(message.from_user.id, rem["text"], MEAL)
+                response_lines.append(f"\n🍽 Буду напоминать, как только запишешь еду: {rem['text']}")
             else:
                 response_lines.append(
                     f"\n⏰ Во сколько напоминать «{rem['text']}»? Напиши, например:\n"
@@ -446,11 +492,19 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         if encouragement:
             response_lines.append(f"\n{encouragement}")
 
-        markup = None
+        builder = InlineKeyboardBuilder()
+
+        # Напоминания «после еды»: если в записи была еда
+        if any(isinstance(a, dict) and a.get("category") == "Еда" for a in activities):
+            for r_id, r_text, r_time in await db_manager.get_reminders(message.from_user.id):
+                if r_time == MEAL:
+                    response_lines.append(f"\n🍽 Не забудь: {r_text}")
+                    builder.button(text=f"✅ {r_text[:30]}", callback_data=f"remdone_{r_id}")
+
         if activity_ids or task_ids:
-            builder = InlineKeyboardBuilder()
             builder.button(text="↩️ Отменить запись", callback_data=f"undo_{_ids(activity_ids)}_{_ids(task_ids)}")
-            markup = builder.as_markup()
+        builder.adjust(1)
+        markup = builder.as_markup() if list(builder.buttons) else None
         await status_msg.edit_text("\n".join(response_lines), reply_markup=markup)
 
     except Exception as e:
