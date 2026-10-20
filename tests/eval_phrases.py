@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytz  # noqa: E402
 import config  # noqa: E402
-from services.ai_parser import parse_voice_text  # noqa: E402
+from services.ai_parser import parse_voice_text, LAST_USAGE  # noqa: E402
+from bot.handlers import CORRECTION_RE, QUESTION_RE  # noqa: E402
 
 
 def now_local():
@@ -102,19 +103,28 @@ CASES = [
 
 
 async def main(runs: int):
-    total_ok = 0
+    total_ok, tokens = 0, []
     for phrase, context, check in CASES:
         results = []
+        # Как в боте: правила поправок в подсказке — только для вопросов и поправок
+        with_edits = bool(CORRECTION_RE.search(phrase) or QUESTION_RE.search(phrase))
         for _ in range(runs):
-            r = await parse_voice_text(phrase, KNOWN_TITLES, "", context)
+            LAST_USAGE.clear()
+            r = await parse_voice_text(phrase, KNOWN_TITLES, "", context, with_edits=with_edits)
             results.append(check(r, now_local()))
+            if LAST_USAGE:
+                tokens.append(LAST_USAGE["total"])
         ok = sum(1 for e in results if e is None)
         total_ok += ok
         mark = "✅" if ok == runs else ("⚠️ " if ok else "❌")
-        print(f"{mark} {ok}/{runs}  {phrase}")
+        used = f"  [{LAST_USAGE['total']} ток., {LAST_USAGE['model']}]" if LAST_USAGE else ""
+        print(f"{mark} {ok}/{runs}  {phrase}{used}")
         for e in {e for e in results if e}:
             print(f"      {e}")
     print(f"\nИтого: {total_ok}/{len(CASES) * runs}")
+    if tokens:
+        print(f"Токенов на сообщение (вход + ответ, последний запрос): в среднем {sum(tokens) // len(tokens)}, "
+              f"от {min(tokens)} до {max(tokens)}")
 
 
 if __name__ == "__main__":

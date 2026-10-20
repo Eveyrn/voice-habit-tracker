@@ -970,12 +970,41 @@ async def handle_text(message: types.Message):
     await process_entry(message, status_msg, message.text.strip())
 
 
-async def build_context(user_id: int, now: datetime) -> str:
-    """Что модель должна знать, чтобы отвечать на вопросы и вносить поправки: день, задачи, напоминания,
-    предыдущее сообщение. Номера (#) — настоящие id в базе."""
+# Когда модели нужен ПОЛНЫЙ контекст (номера дел и задач, прошлое сообщение, правила поправок).
+# Обычное «час работала» обходится без него — так одно сообщение стоит примерно вдвое меньше токенов.
+CORRECTION_RE = re.compile(r"^\s*(нет|не,|неа|не так|неправ|исправ|поправ|удали|убери|отмени|измени|поменяй|перенеси|"
+                           r"это было|было не|не каждый|только сегодня|только завтра)", re.I)
+QUESTION_RE = re.compile(r"\?|^\s*(что|сколько|когда|во сколько|какие|какой|какая|где|покажи|расскажи|есть ли|а что)\b", re.I)
+REFERENCE_RE = re.compile(r"\b(это|этого|его|её|ее|их|то напоминание|ту задачу|то дело|последн)", re.I)
+
+
+async def needs_full_context(user_id: int, text: str, now: datetime) -> bool:
+    if CORRECTION_RE.search(text) or QUESTION_RE.search(text):
+        return True
+    if REFERENCE_RE.search(text):
+        last = await db_manager.get_last_entry(user_id)
+        if last:
+            try:
+                return (now.replace(tzinfo=None) - datetime.fromisoformat(last[3])).total_seconds() <= 30 * 60
+            except (TypeError, ValueError):
+                return False
+    return False
+
+
+async def build_context(user_id: int, now: datetime, full: bool = True, text: str = "") -> str:
+    """Что модель должна знать о пользователе. Номера (#) — настоящие id в базе.
+    full=False — только напоминания (для привычек и «встретилась с мамой» ↔ «В 15:00 быть у мамы»).
+    full=True — ещё дела за сегодня, задачи, прошлое сообщение; вчера — если в тексте «вчера»,
+    итоги недели — если спрашивают про период."""
     today = now.strftime("%Y-%m-%d")
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     lines = []
+
+    reminders = await db_manager.get_reminders(user_id, from_date=today)
+    if reminders:
+        lines.append("Напоминания:")
+        lines.extend(f"- напоминание #{r_id}: {format_when(r_time, r_date)} — {r_text}" for r_id, r_text, r_time, r_date in reminders)
+    if not full:
+        return "\n".join(lines)
 
     acts = await db_manager.get_activities_for_day(user_id, today)
     if acts:
@@ -983,33 +1012,28 @@ async def build_context(user_id: int, now: datetime) -> str:
         for a_id, title, utility, category, duration, start, end in acts[-40:]:
             lines.append(f"- дело #{a_id}: {_hm(start)}–{_hm(end)} {title} ({utility}, {category}, {duration} мин)")
 
-    acts_y = await db_manager.get_activities_for_day(user_id, yesterday)
-    if acts_y:
-        lines.append("Записано вчера:")
+    if re.search(r"вчера", text, re.I):
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        acts_y = await db_manager.get_activities_for_day(user_id, yesterday)
+        lines.append("Записано вчера:" if acts_y else "Вчера записей нет.")
         lines.extend(f"- {_hm(start)}–{_hm(end)} {title} ({duration} мин)" for _, title, _, _, duration, start, end in acts_y[-25:])
 
-    # Итоги по дням за неделю — чтобы на «сколько я за неделю…» модель считала по фактам и видела пустые дни
-    week_start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
-    totals = {}
-    for day, category, minutes in await db_manager.get_daily_totals(user_id, week_start):
-        totals.setdefault(day, {})[category] = int(minutes or 0)
-    lines.append(f"Итоги по категориям за последние 7 дней (с {week_start}); дней с записями: {len(totals)}:")
-    if totals:
+    if PERIOD_RE.search(text):
+        # Итоги по дням за неделю — чтобы модель считала по фактам и видела пустые дни
+        week_start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+        totals = {}
+        for day, category, minutes in await db_manager.get_daily_totals(user_id, week_start):
+            totals.setdefault(day, {})[category] = int(minutes or 0)
+        lines.append(f"Итоги по категориям за последние 7 дней (с {week_start}); дней с записями: {len(totals)}:")
         for day in sorted(totals):
-            parts = ", ".join(f"{c} {m} мин" for c, m in totals[day].items())
-            lines.append(f"- {day}: {parts}")
-    else:
-        lines.append("- записей нет")
+            lines.append(f"- {day}: " + ", ".join(f"{c} {m} мин" for c, m in totals[day].items()))
+        if not totals:
+            lines.append("- записей нет")
 
     tasks = await db_manager.get_pending_tasks(user_id)
     if tasks:
         lines.append("Открытые задачи:")
         lines.extend(f"- задача #{t_id}: {title}{_due_label(due, today)}" for t_id, title, due in tasks[:30])
-
-    reminders = await db_manager.get_reminders(user_id, from_date=today)
-    if reminders:
-        lines.append("Напоминания:")
-        lines.extend(f"- напоминание #{r_id}: {format_when(r_time, r_date)} — {r_text}" for r_id, r_text, r_time, r_date in reminders)
 
     done_today = [name for name, _, last in await db_manager.get_habits(user_id) if last == today]
     if done_today:
@@ -1017,13 +1041,13 @@ async def build_context(user_id: int, now: datetime) -> str:
 
     last = await db_manager.get_last_entry(user_id)
     if last:
-        _, text, data, created_at = last
+        _, last_text, data, created_at = last
         try:
             ago = int((now.replace(tzinfo=None) - datetime.fromisoformat(created_at)).total_seconds() // 60)
         except (TypeError, ValueError):
             ago = None
         if ago is not None and ago <= 6 * 60:
-            lines.append(f"\nПРЕДЫДУЩЕЕ СООБЩЕНИЕ ({ago} мин назад): «{text}»")
+            lines.append(f"ПРЕДЫДУЩЕЕ СООБЩЕНИЕ ({ago} мин назад): «{last_text}»")
             if data.get("summary"):
                 lines.append("Что бот из него создал: " + "; ".join(data["summary"]))
 
@@ -1180,8 +1204,15 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
 
         about = await db_manager.get_setting(user_id, "about", "")
         known_titles = [row[0] for row in await db_manager.get_top_patterns(user_id)][:60]
-        context = await build_context(user_id, now)
-        analysis = await parse_voice_text(transcript, known_titles, about, context)
+        full = await needs_full_context(user_id, transcript, now)
+        context = await build_context(user_id, now, full, transcript)
+        analysis = await parse_voice_text(transcript, known_titles, about, context, with_edits=full)
+        # Подстраховка: модель увидела вопрос или поправку, а полного контекста ей не дали — переспрашиваем с ним
+        if not full and not analysis.get("rate_limited") and \
+                (analysis["intent"] in ("question", "correction") or analysis["edits"]):
+            print("[context] нужен полный контекст — переспрашиваю")
+            context = await build_context(user_id, now, True, transcript)
+            analysis = await parse_voice_text(transcript, known_titles, about, context, with_edits=True)
         await quota_watch(message.bot, analysis.get("rate_limited"))
         if analysis.get("rate_limited"):
             # Ничего не разобрано — не «👎», а просто честное «лимит, попробуй позже»

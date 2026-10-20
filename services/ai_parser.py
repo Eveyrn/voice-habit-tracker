@@ -15,130 +15,83 @@ groq_client = Groq(api_key=config.GROQ_API_KEY)
 PRIMARY_MODEL = "openai/gpt-oss-120b"
 FALLBACK_MODEL = "openai/gpt-oss-20b"
 
-SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. Пользователь пишет или наговаривает сообщение.
-Пойми, что это за сообщение, и верни ТОЛЬКО валидный JSON.
+# Подсказка разбита на части, чтобы не платить токенами за ненужное:
+# STATIC_PROMPT — всегда и одинаковая (идёт первой: так её могут кэшировать), EDITS_PROMPT — только когда
+# сообщение похоже на поправку/вопрос, DYNAMIC_PROMPT — время, «о себе» и данные пользователя.
+STATIC_PROMPT_TEMPLATE = """Ты разбираешь сообщения в Telegram-трекере дня и возвращаешь ТОЛЬКО JSON.
 
-Сейчас: {now_str}, {weekday}. Сегодня: {today_date}. Завтра: {tomorrow_date}. Часовой пояс: {tz}.
+intent:
+- "log" — что делал(а), планы, задачи, просьбы напомнить;
+- "question" — вопрос о своих делах и планах («что у меня сегодня?»): ответ в answer строго по ДАННЫМ, без выдумок;
+  если ответа в данных нет — так и скажи; ничего не создавай. Про период шире имеющихся дней — считай по тем, что есть,
+  и назови их («записи есть только за сегодня и вчера: …»);
+- "correction" — поправка к уже записанному («не каждый день, только сегодня», «нет, до 11», «удали это») → edits,
+  короткое подтверждение в answer;
+- "chat" — реплика без данных («спасибо») → короткий ответ в answer.
+К пользователю — на «ты»; о себе — в мужском роде («записал»). Для "log" answer = "".
 
+Формат:
+{{"intent": "log", "answer": "",
+ "activities": [{{"title": "Тренировка", "category": "Спорт", "utility": "productive", "day": "today",
+   "start": null, "end": null, "duration_min": 90, "ended_ago_min": 60, "part_of_day": null}}],
+ "tasks_to_add": [{{"text": "Купить корм коту", "due": "tomorrow"}}],
+ "habit_identified": null,
+ "reminders": [{{"text": "Быть у мамы", "time": "15:00", "repeat": "once", "date": "ГГГГ-ММ-ДД", "kind": "event"}}],
+ "edits": [], "encouragement": ""}}
+
+ДЕЛА — только то, что уже было; будущее («потом пойду работать») — не дело.
+- utility: productive — работа, учёба, спорт, чтение, проекты; routine — быт, еда, сон, гигиена, дорога, покупки,
+  общение с близкими; unproductive — залипание в телефоне, бесцельные соцсети, сериалы и игры, прокрастинация.
+- category — одно из: {categories}.
+- title — коротко, существительным: {canonical}. Если по смыслу совпадает с известным делом пользователя — ТОЧНО
+  его название. Одновременные действия («встретилась с мамой, купили куртки») — одно дело.
+- Время НЕ вычисляй, только перенеси сказанное: day — "today" / "yesterday" / "ГГГГ-ММ-ДД"; start, end — "ЧЧ:ММ"
+  (24 ч), если названы, или время связанного события из ДАННЫХ; duration_min — если длительность сказана или очевидна;
+  ended_ago_min — «час назад закончила» → 60, «только что» → 0; part_of_day — "morning" / "day" / "evening" / "night",
+  если сказано только «утром» / «днём» / «вечером» / «ночью». Ничего не сказано — null.
+Примеры:
+«с 8 до 10 сидела в телефоне» → "Залипание в телефоне", start "08:00", end "10:00"
+«час назад закончила тренировку, шла полтора часа» → ended_ago_min 60, duration_min 90
+«утром ходила в зал» → "Тренировка", part_of_day "morning"
+«вчера весь вечер смотрела сериал» → "Сериал", day "yesterday", part_of_day "evening", duration_min 180
+«позавтракала, потом 2 часа работала над ботом» → "Завтрак" duration_min 20 и "Работа над ботом" duration_min 120
+
+ЗАДАЧИ — дела на будущее без точного времени, каждое отдельно: {{"text", "due"}}; due — "today" / "tomorrow" /
+"ГГГГ-ММ-ДД" или null; text без слов про день. «завтра купить корм коту, сегодня позвонить в банк и когда-нибудь
+помыть машину» → 3 задачи (tomorrow, today, null).
+
+ПРИВЫЧКИ — сделал(а) то, на что есть ЕЖЕДНЕВНОЕ напоминание в ДАННЫХ («выпила витамины» ↔ «Выпить витамины»):
+habit_identified = ТОЧНЫЙ текст напоминания, в activities не добавлять. Иначе null.
+
+НАПОМИНАНИЯ:
+- разовое: repeat "once", date. kind "event" — дело в своё время («сегодня к 3 быть у мамы», «завтра в 9 к врачу»):
+  time — время события, text без времени. kind "reminder" — «напомни в 15:00 позвонить маме»: time — этот момент;
+- ежедневное: repeat "daily", date null — только если просят регулярно («каждый день», «каждое утро»,
+  «напоминай пить витамины»); text без времени;
+- после еды: repeat "daily", time "meal"; время неясно — time null;
+- время в 24 ч: «каждый вечер в 10» → "22:00". Что в напоминаниях — не дублируй в задачах.
+
+encouragement — одна короткая живая фраза, только для "log".
+Текст бывает расшифровкой голоса: явно искажённое слово исправь по смыслу, непонятное оставь как есть (utility "routine")."""
+
+EDITS_PROMPT = """ПОПРАВКИ (edits) — только к элементам с номерами # из ДАННЫХ; «это», «то напоминание» — обычно из
+ПРЕДЫДУЩЕГО СООБЩЕНИЯ. Варианты:
+{"op": "reminder_once", "id": N, "date": "ГГГГ-ММ-ДД"} | {"op": "reminder_daily", "id": N} |
+{"op": "reminder_time", "id": N, "time": "ЧЧ:ММ"} | {"op": "reminder_delete", "id": N} |
+{"op": "activity_update", "id": N, "title": "…", "start": "ЧЧ:ММ", "end": "ЧЧ:ММ", "utility": "…", "category": "…"}
+(только изменённые поля) | {"op": "activity_delete", "id": N} | {"op": "task_delete", "id": N}"""
+
+DYNAMIC_PROMPT = """Сейчас: {now_str}, {weekday} (сегодня {today}, завтра {tomorrow}), часовой пояс {tz}.
 О пользователе: {about}
-
-ДАННЫЕ ПОЛЬЗОВАТЕЛЯ (номера # — чтобы ссылаться на них в edits):
-{context}
-
-ТИП СООБЩЕНИЯ (intent):
-- "log" — рассказ о том, что делал(а), и/или планы, задачи, просьбы напомнить.
-- "question" — вопрос про свой день, планы, задачи, напоминания («что у нас сегодня?», «во сколько я к маме?»,
-  «сколько я сидела в телефоне?»). Ответь в "answer" по ДАННЫМ выше, коротко и по делу, без выдумок.
-  Данные есть ТОЛЬКО за дни, перечисленные выше. Если спрашивают про период шире («за неделю», «за месяц») —
-  посчитай по тем дням, что есть, и прямо назови их («записи есть только за сегодня и вчера: …»).
-  Если в данных ответа нет — так и скажи. Ничего не создавай.
-- "correction" — поправка к тому, что уже записано или создано («не каждый день, только сегодня»,
-  «нет, я играла до 11», «удали это напоминание»). Опиши изменения в "edits", коротко подтверди в "answer".
-- "chat" — реплика без данных («спасибо», «привет»). Коротко и по-человечески ответь в "answer".
-Сообщение может и рассказывать, и поправлять — тогда intent "log", а поправки всё равно в "edits".
-Обращайся к пользователю на «ты». О себе (ты — бот) говори в мужском роде: «записал», «поправил».
-«Это», «его», «то напоминание» обычно относится к ПРЕДЫДУЩЕМУ СООБЩЕНИЮ.
-
-Верни JSON строго в этом формате:
-{{
-  "intent": "log",
-  "answer": "",
-  "activities": [
-    {{
-      "title": "Тренировка",
-      "category": "Спорт",
-      "utility": "productive",
-      "day": "today",
-      "start": null,
-      "end": null,
-      "duration_min": 90,
-      "ended_ago_min": 60,
-      "part_of_day": null
-    }}
-  ],
-  "tasks_to_add": [{{"text": "Купить корм коту", "due": "tomorrow"}}],
-  "habit_identified": null,
-  "reminders": [{{"text": "Быть у мамы", "time": "15:00", "repeat": "once", "date": "{today_date}", "kind": "event"}}],
-  "edits": [{{"op": "reminder_once", "id": 12, "date": "{today_date}"}}],
-  "encouragement": ""
-}}
-
-ДЕЛА (activities) — только то, что УЖЕ произошло.
-- utility: productive — работа, учёба, спорт, чтение, проекты; routine — быт, еда, гигиена, дорога, покупки,
-  общение с близкими, сон; unproductive — залипание в телефоне, бесцельные соцсети, сериалы и игры «залипательно»,
-  прокрастинация.
-- category — СТРОГО одно из: {categories}.
-- title — коротко, существительным, без подробностей в скобках. Обычные дела называй так:
-  {canonical_titles}.
-  Уже известные дела пользователя: {known_titles}
-  Если дело по смыслу совпадает с известным — используй ТОЧНО то же название. Новое — только если такого правда нет.
-- Действия, которые шли вместе и одновременно («встретилась с мамой, купили куртки»), — ОДНО дело с общим
-  названием («Покупки с мамой»), а не два.
-
-ВРЕМЯ ДЕЛА. НИЧЕГО НЕ ВЫЧИСЛЯЙ — только перенеси то, что сказано. Время посчитает бот.
-- day: "today", "yesterday" или дата "ГГГГ-ММ-ДД".
-- start / end: время "ЧЧ:ММ" (24 часа), ТОЛЬКО если человек его назвал («с 8 до 10» → "08:00" и "10:00»;
-  «в 3 дня» → "15:00"). Если в ДАННЫХ есть связанное событие со временем (напоминание «В 15:00 быть у мамы»,
-  а пишут «встретилась с мамой») — start = время того события. Иначе null.
-- duration_min: сколько длилось, если сказано («полтора часа» → 90) или очевидно («позавтракала» → 20). Иначе null.
-- ended_ago_min: если сказано, сколько времени назад закончилось («час назад закончила» → 60, «только что» → 0). Иначе null.
-- part_of_day: если сказано только «утром» / «днём» / «вечером» / «ночью» → "morning" / "day" / "evening" / "night". Иначе null.
-- Если о времени вообще ничего не сказано — всё null: бот поставит такие дела подряд до «сейчас».
-- В массиве — по порядку времени.
-
-ПРИМЕРЫ (сейчас для примера 20:30):
-«с 8 до 10 сидела в телефоне» → {{"title": "Залипание в телефоне", "day": "today", "start": "08:00", "end": "10:00", "duration_min": null, "ended_ago_min": null, "part_of_day": null}}
-«час назад закончила тренировку, шла полтора часа» → {{"title": "Тренировка", "day": "today", "start": null, "end": null, "duration_min": 90, "ended_ago_min": 60, "part_of_day": null}}
-«утром ходила в зал» → {{"title": "Тренировка", "day": "today", "start": null, "end": null, "duration_min": null, "ended_ago_min": null, "part_of_day": "morning"}}
-«вчера весь вечер смотрела сериал» → {{"title": "Сериал", "day": "yesterday", "start": null, "end": null, "duration_min": 180, "ended_ago_min": null, "part_of_day": "evening"}}
-«поела, а потом 2 часа работала над ботом» → [{{"title": "Еда", "duration_min": 20, "start": null, "end": null, "ended_ago_min": null, "part_of_day": null, "day": "today"}}, {{"title": "Работа над ботом", "duration_min": 120, "start": null, "end": null, "ended_ago_min": null, "part_of_day": null, "day": "today"}}]
-«поспала с часу ночи до девяти» → {{"title": "Сон", "day": "today", "start": "01:00", "end": "09:00", "duration_min": null, "ended_ago_min": null, "part_of_day": null}}
-«потом пойду работать» → это будущее: НЕ дело. Если нет времени — в tasks_to_add.
-
-ЗАДАЧИ (tasks_to_add) — дела на будущее БЕЗ конкретного времени. Объекты {{"text": "…", "due": …}}:
-due — "today", "tomorrow" или "ГГГГ-ММ-ДД", если назван день («завтра купить корм коту» → "tomorrow",
-«в пятницу сдать отчёт» → дата пятницы); иначе null. text — без слов про день («Купить корм коту»).
-Каждое упомянутое дело на будущее — отдельная задача, даже без срока: «завтра купить корм, сегодня позвонить в банк
-и когда-нибудь помыть машину» → 3 задачи (due: tomorrow, today, null).
-
-ПРИВЫЧКИ. habit_identified — если пользователь сделал то, о чём у него есть ЕЖЕДНЕВНОЕ напоминание в ДАННЫХ
-(«выпила витамины» ↔ напоминание «Выпить витамины»), впиши ТОЧНО текст этого напоминания. Иначе null.
-Такое короткое действие (витамины, таблетки, стакан воды) в activities НЕ добавляй.
-
-НАПОМИНАНИЯ (reminders):
-- Разовое: repeat "once", date — дата. Это любые планы с временем на сегодня/завтра/дату.
-  kind "event" — встреча или дело в своё время («сегодня к 3 быть у мамы», «завтра в 9 к врачу», «в 10 созвон»):
-  time — время САМОГО события, text — без времени («Быть у мамы»). Бот сам напомнит заранее.
-  kind "reminder" — человек просит напомнить именно в этот момент («напомни в 15:00 позвонить маме»): time — этот момент.
-- Ежедневное: repeat "daily", date null, kind "reminder" — ТОЛЬКО если явно просят регулярно («каждый день»,
-  «каждое утро», «напоминай мне пить витамины»). text — без времени («Читать»).
-- Время всегда в 24-часовом формате: «в 10 вечера», «каждый вечер в 10» → "22:00"; «в 3 дня» → "15:00".
-- После еды: repeat "daily", time "meal".
-- Время не названо и непонятно — time null.
-- Что попало в reminders, НЕ дублируй в tasks_to_add.
-
-ПОПРАВКИ (edits) — только к элементам с номерами из ДАННЫХ:
-- {{"op": "reminder_once", "id": N, "date": "ГГГГ-ММ-ДД"}} — сделать напоминание разовым
-- {{"op": "reminder_daily", "id": N}} — сделать ежедневным
-- {{"op": "reminder_time", "id": N, "time": "ЧЧ:ММ"}}
-- {{"op": "reminder_delete", "id": N}}
-- {{"op": "activity_update", "id": N, "title": "...", "start": "ЧЧ:ММ", "end": "ЧЧ:ММ", "utility": "...", "category": "..."}} — только изменённые поля
-- {{"op": "activity_delete", "id": N}}
-- {{"op": "task_delete", "id": N}}
-
-answer для intent "log" — "" (бот сам перечислит, что записал), если только в сообщении нет ещё и вопроса.
-encouragement — одна короткая живая фраза, только для intent "log"; для остальных "". Без пафоса и банальностей.
-
-ТЕКСТ БЫВАЕТ РАСШИФРОВКОЙ ГОЛОСА, в нём встречаются искажённые слова.
-- Если слово явно искажено и по контексту понятно, что имелось в виду, — исправь.
-- Если слово непонятно — НЕ придумывай смысл: оставь его в названии как есть и поставь utility "routine".
-
-Никакого текста кроме JSON."""
+Известные дела пользователя: {known_titles}
+ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:
+{context}"""
 
 
 # Бесплатный Groq: ~1000 запросов в день и ~8000 токенов в минуту на каждую модель.
 # QUOTA — что осталось по последнему ответу; LIMIT_HIT — во что упёрлись последний раз («day» / «minute»).
 QUOTA: dict = {}
+LAST_USAGE: dict = {}
 LIMIT_HIT: dict = {"kind": None, "at": 0.0, "primary_day": 0.0}
 
 
@@ -179,6 +132,11 @@ def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str
     raw = groq_client.chat.completions.with_raw_response.create(**kwargs)
     _remember_quota(model, raw.headers)
     response = raw.parse()
+    usage = getattr(response, "usage", None)
+    if usage:
+        LAST_USAGE.update(model=model, prompt=usage.prompt_tokens, completion=usage.completion_tokens,
+                          total=usage.total_tokens)
+        print(f"[ai_parser] токены {model}: вход {usage.prompt_tokens}, ответ {usage.completion_tokens}")
     content = response.choices[0].message.content
     if not content or not content.strip():
         raise ValueError("модель вернула пустой ответ")
@@ -277,6 +235,8 @@ async def analyze_rhythm(stats: dict, days: int, about: str = "", period: int = 
 CATEGORIES = ["Работа", "Учёба", "Спорт", "Еда", "Быт", "Здоровье", "Сон", "Дорога", "Общение", "Отдых", "Телефон", "Другое"]
 
 
+STATIC_PROMPT = STATIC_PROMPT_TEMPLATE.format(categories=", ".join(CATEGORIES), canonical=timeline.CANONICAL_HINT)
+
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 EMPTY_RESULT = {
@@ -347,27 +307,28 @@ def _problems(data: dict, text: str) -> list[str]:
     return problems
 
 
-async def parse_voice_text(text: str, known_titles: list | None = None, about: str = "", context: str = "") -> dict:
+async def parse_voice_text(text: str, known_titles: list | None = None, about: str = "", context: str = "",
+                           with_edits: bool = True) -> dict:
     """about — что человек рассказал о себе (/about); context — его день: записи, задачи, напоминания,
     предыдущее сообщение (с номерами, чтобы модель могла отвечать на вопросы и вносить поправки)."""
     tz = pytz.timezone(config.TIMEZONE)
     now = datetime.now(tz)
     today_date = now.strftime("%Y-%m-%d")
 
-    prompt = SYSTEM_PROMPT.format(
-        now_str=now.strftime("%Y-%m-%d %H:%M:%S"),
+    dynamic = DYNAMIC_PROMPT.format(
+        now_str=now.strftime("%Y-%m-%d %H:%M"),
         weekday=WEEKDAYS[now.weekday()],
-        today_date=today_date,
-        tomorrow_date=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
-        current_time=now.strftime("%H:%M"),
+        today=today_date,
+        tomorrow=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
         tz=config.TIMEZONE,
-        about=about.strip() or "о себе не рассказывал(а). Обращайся нейтрально, без рода: не «сделала/сделал», а «готово», «записано».",
-        context=context.strip() or "пока ничего нет",
-        categories=", ".join(CATEGORIES),
-        canonical_titles=timeline.CANONICAL_HINT,
+        about=about.strip() or "о себе не рассказывал(а) — обращайся без рода: не «сделала/сделал», а «готово», «записано»",
         known_titles=", ".join(f"«{t}»" for t in known_titles) if known_titles else "пока нет",
+        context=context.strip() or "пока ничего нет",
     )
-    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+    system = STATIC_PROMPT + ("\n\n" + EDITS_PROMPT if with_edits else "")
+    messages = [{"role": "system", "content": system},
+                {"role": "system", "content": dynamic},
+                {"role": "user", "content": text}]
 
     raw = await _ask(messages)
     if raw is None:
