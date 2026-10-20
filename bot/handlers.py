@@ -461,7 +461,7 @@ async def rhythm_report(user_id: int, days: int) -> str:
     since = (_now_local() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     stats, days_with_data = await db_manager.get_activity_stats(user_id, since)
     about = await db_manager.get_setting(user_id, "about", "")
-    return await analyze_rhythm(stats, days_with_data, about)
+    return await analyze_rhythm(stats, days_with_data, about, period=days)
 
 
 @router.message(Command("plan"))

@@ -134,33 +134,52 @@ def _clean_json(raw: str) -> str:
     return raw
 
 
-RHYTHM_PROMPT = """Ты — спокойный коуч по распорядку дня. Ниже сводка записей человека за {days} дн. Время — местное.
-О человеке: {about}
+RHYTHM_PROMPT = """Ты — спокойный коуч по распорядку дня. Разбираешь записи пользователя в Telegram-трекере
+и пишешь ему напрямую, на «ты». О пользователе: {about}
 
-{stats}
+Период: последние {period} дн., из них с записями — {days} дн. Время — местное.
+
+ПОВТОРЯЮЩИЕСЯ ДЕЛА (были в 2+ днях). Цифры уже посчитаны В СРЕДНЕМ ЗА ДЕНЬ, когда дело было, — не складывай и не умножай их:
+{repeating}
+
+РАЗОВЫЕ ДЕЛА (было 1 день) — только для фона, в расписание их НЕ включай:
+{single}
 
 Напиши по-русски, коротко, обычным текстом без markdown-таблиц и без символов * и #:
-1. Ритм — 2–3 наблюдения с цифрами (когда человек продуктивнее всего, сколько уходит на телефон и в какое время).
+1. Ритм — 2–3 наблюдения с цифрами из сводки (когда ты продуктивнее, сколько в день уходит на телефон и когда).
 2. Что съедает время — одно главное.
-3. Предложение расписания на обычный день: 5–8 строк вида «09:00–10:00 — …», опираясь на реальные привычки, а не на идеал из книжек.
+3. Расписание обычного дня: 5–8 строк вида «09:00–10:00 — …» ТОЛЬКО из повторяющихся дел и базовых вещей
+   (сон, еда), опираясь на реальное время из сводки, а не на идеал из книжек. Залипание и прокрастинацию
+   в расписание как цель не ставь — вместо них короткое окно отдыха.
 4. Один маленький шаг на завтра.
-Если данных мало (меньше 3 дней), честно скажи об этом и дай только то, что можно сказать."""
+Если дней с записями меньше 3 — честно скажи, что данных мало, и дай только то, что видно, без расписания."""
 
 
-async def analyze_rhythm(stats: dict, days: int, about: str = "") -> str:
+def _fmt_hour(hours: list) -> str:
+    avg = sum(hours) / len(hours)
+    return f"{int(avg):02d}:{int(round(avg % 1 * 60)) % 60:02d}"
+
+
+async def analyze_rhythm(stats: dict, days: int, about: str = "", period: int = 21) -> str:
     """Разбор ритма по сводке get_activity_stats. Возвращает готовый текст для Telegram."""
     if not stats:
         return "Пока нет записей за этот период — расскажи мне о паре дней, и я разберу твой ритм."
 
-    lines = []
+    repeating, single = [], []
     for title, s in sorted(stats.items(), key=lambda kv: -kv[1]["minutes"]):
-        hours = s["hours"]
-        when = f", обычно начинается около {int(sum(hours) / len(hours)):02d}:{int(sum(hours) / len(hours) % 1 * 60):02d}" if hours else ""
-        lines.append(f"- {title} [{s['utility']}, {s['category']}]: {len(s['days'])} дн., всего {s['minutes']} мин{when}")
+        n_days = max(1, len(s["days"]))
+        when = f", обычно начинается около {_fmt_hour(s['hours'])}" if s["hours"] else ""
+        if n_days >= 2:
+            repeating.append(f"- {title} [{s['utility']}, {s['category']}]: в {n_days} из {days} дн., "
+                             f"в среднем {round(s['minutes'] / n_days)} мин в такой день{when}")
+        else:
+            single.append(f"- {title} [{s['utility']}]: {s['minutes']} мин{when}")
 
     messages = [{"role": "user", "content": RHYTHM_PROMPT.format(
-        days=days, stats="\n".join(lines),
-        about=about.strip() or "о себе не рассказывал(а) — пиши нейтрально, без рода")}]
+        period=period, days=days,
+        repeating="\n".join(repeating) or "пока нет",
+        single="\n".join(single[:20]) or "нет",
+        about=about.strip() or "о себе не рассказывал(а) — пиши без рода: не «сделала/сделал»")}]
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
             return (await asyncio.to_thread(_call_groq, model, messages, False)).replace("**", "").strip()
