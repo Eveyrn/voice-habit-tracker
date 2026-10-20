@@ -32,10 +32,13 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
       "end_time": "2024-01-01T09:00:00"
     }}
   ],
-  "tasks_to_add": [],
+  "tasks_to_add": ["Позвонить маме"],
   "habit_identified": null,
   "encouragement": "Мотивирующая фраза на русском"
 }}
+
+tasks_to_add — список СТРОК (только текст задачи), пустой список, если планов нет.
+habit_identified — строка с названием привычки или null.
 
 Замени дату на {today_date}. Никакого текста кроме JSON."""
 
@@ -157,6 +160,23 @@ async def parse_voice_text(text: str) -> dict:
     if not data["activities"]:
         for k, v in data.items():
             if isinstance(v, dict) and "activities" in v:
-                return v
+                data = v
+                break
+
+    # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
+    data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
+    data["habit_identified"] = _as_text(data.get("habit_identified")) or None
 
     return data
+
+
+def _as_text(value) -> str:
+    """Достаёт текст из строки или из объекта вида {"title": ...}."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("title", "task", "text", "name", "description"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                return value[key].strip()
+        return ""
+    return str(value).strip() if value else ""
