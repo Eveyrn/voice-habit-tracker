@@ -7,9 +7,9 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
-from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION
+from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION, day_report
 from database.db_manager import (
-    init_db, get_or_create_profile, get_today_summary,
+    init_db, get_or_create_profile,
     get_due_reminders, mark_reminder_sent,
 )
 
@@ -44,12 +44,9 @@ async def afternoon_checkin(bot: Bot):
 async def evening_checkin(bot: Bot):
     tz = pytz.timezone(config.TIMEZONE)
     today_str = datetime.now(tz).strftime("%Y-%m-%d")
-    stats = await get_today_summary(config.ALLOWED_USER_IDS[0], today_str)
-    
-    total = sum(i[2] for i in stats) if stats else 0
+    report = await day_report(config.ALLOWED_USER_IDS[0], today_str)
     msg = (
-        f"🌙 Добрый вечер!\n\n"
-        f"Сегодня учтено: {total} мин ({round(total/60, 1)} ч).\n"
+        f"🌙 Добрый вечер!\n\n{report}\n\n"
         "Расскажи в голосовом, как прошёл вечер и чем ещё занималась перед сном!"
     )
     await send_checkin(bot, msg)

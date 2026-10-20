@@ -239,22 +239,51 @@ async def cmd_summary(message: types.Message):
     if not check_auth(message.from_user.id):
         return
 
-    tz = pytz.timezone(config.TIMEZONE)
-    today_str = datetime.now(tz).strftime("%Y-%m-%d")
-    stats = await db_manager.get_today_summary(message.from_user.id, today_str)
+    today_str = _now_local().strftime("%Y-%m-%d")
+    await message.answer(await day_report(message.from_user.id, today_str))
 
-    if not stats:
-        await message.answer("📊 За сегодня пока нет записанных активностей.")
-        return
 
-    total_time = sum(item[2] for item in stats)
-    text = f"📊 Итоги дня ({today_str}):\nОбщее учтённое время: {total_time} мин ({round(total_time/60, 1)} ч)\n\n"
+def _fmt_min(minutes: int) -> str:
+    h, m = divmod(int(minutes), 60)
+    return f"{h} ч {m} мин" if h and m else (f"{h} ч" if h else f"{m} мин")
 
-    for utility, category, duration in stats:
-        icon = "[Польза]" if utility == "productive" else ("[Быт]" if utility == "routine" else "[Прокрастинация]")
-        text += f"{icon} {category}: {duration} мин\n"
 
-    await message.answer(text)
+async def day_report(user_id: int, today_str: str) -> str:
+    """Итог дня: баланс полезное/быт/телефон, категории, привычки из напоминаний, открытые задачи."""
+    stats = await db_manager.get_today_summary(user_id, today_str)
+    lines = []
+
+    total = sum(int(d or 0) for _, _, d in stats)
+    if total:
+        lines.append(f"📊 Итоги дня — учтено {_fmt_min(total)}\n")
+        by_utility = {}
+        for utility, _, duration in stats:
+            by_utility[utility] = by_utility.get(utility, 0) + int(duration or 0)
+        for key, label in (("productive", "🟢 Полезное"), ("routine", "⚪ Быт"), ("unproductive", "🔴 Прокрастинация")):
+            if by_utility.get(key):
+                lines.append(f"{label}: {_fmt_min(by_utility[key])} · {round(by_utility[key] * 100 / total)}%")
+
+        by_category = {}
+        for _, category, duration in stats:
+            by_category[category] = by_category.get(category, 0) + int(duration or 0)
+        top = sorted(by_category.items(), key=lambda kv: -kv[1])
+        lines.append("\n" + " · ".join(f"{c} {_fmt_min(d)}" for c, d in top))
+    else:
+        lines.append("📊 За сегодня пока нет записанных дел.")
+
+    reminders = await db_manager.get_reminders(user_id)
+    if reminders:
+        done_today = {name for name, _, last in await db_manager.get_habits(user_id) if last == today_str}
+        marks = [("✅ " if text in done_today else "▫️ ") + text for _, text, _ in reminders]
+        lines.append("\nПривычки:\n" + "\n".join(marks))
+
+    tasks = await db_manager.get_pending_tasks(user_id)
+    if tasks:
+        shown = "\n".join(f"- {title}" for _, title, _ in tasks[:5])
+        more = f"\n…и ещё {len(tasks) - 5}" if len(tasks) > 5 else ""
+        lines.append(f"\nОткрытые задачи ({len(tasks)}):\n{shown}{more}")
+
+    return "\n".join(lines)
 
 @router.message(F.voice | F.audio)
 async def handle_voice(message: types.Message):
