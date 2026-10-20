@@ -66,43 +66,30 @@ def normalize_iso(dt_str: str, default_dt: datetime.datetime, offset_minutes: in
         target = default_dt + datetime.timedelta(minutes=offset_minutes)
         return target.isoformat()
 
+def build_event(summary: str, start_time: str, end_time: str, utility: str = 'productive', description: str = '') -> dict:
+    """Тело события Google: время с часовым поясом, конец позже начала, цвет и значок по пользе."""
+    now_dt = datetime.datetime.now(pytz.timezone(config.TIMEZONE))
+    valid_start = normalize_iso(start_time, now_dt, -30)
+    valid_end = normalize_iso(end_time, now_dt, 0)
+    if valid_end <= valid_start:
+        valid_end = (datetime.datetime.fromisoformat(valid_start) + datetime.timedelta(minutes=30)).isoformat()
+
+    prefix = "🟢 " if utility == "productive" else ("⚪ " if utility == "routine" else "🔴 ")
+    return {
+        'summary': f"{prefix}{summary}",
+        'description': description,
+        'start': {'dateTime': valid_start, 'timeZone': config.TIMEZONE},
+        'end': {'dateTime': valid_end, 'timeZone': config.TIMEZONE},
+        'colorId': COLOR_MAP.get(utility, '10'),
+    }
+
+
 def add_event(summary: str, start_time: str, end_time: str, utility: str = 'productive', description: str = ''):
-    """
-    Добавляет событие в календарь Google с валидацией таймзон и дат.
-    """
+    """Старый путь владельца: token.json и основной календарь. Если владелец подключился через /calendar,
+    используется его личный «Трекер дня», а этот путь не нужен."""
     try:
         service = get_calendar_service()
-        color_id = COLOR_MAP.get(utility, '10')
-
-        tz = pytz.timezone(config.TIMEZONE)
-        now_dt = datetime.datetime.now(tz)
-
-        # Валидация и нормализация времени
-        valid_start = normalize_iso(start_time, now_dt, -30)
-        valid_end = normalize_iso(end_time, now_dt, 0)
-
-        # Проверка чтобы конец был позже начала
-        if valid_end <= valid_start:
-            s_obj = datetime.datetime.fromisoformat(valid_start)
-            valid_end = (s_obj + datetime.timedelta(minutes=30)).isoformat()
-
-        prefix = "🟢 " if utility == "productive" else ("⚪ " if utility == "routine" else "🔴 ")
-        event_title = f"{prefix}{summary}"
-
-        event = {
-            'summary': event_title,
-            'description': description,
-            'start': {
-                'dateTime': valid_start,
-                'timeZone': config.TIMEZONE,
-            },
-            'end': {
-                'dateTime': valid_end,
-                'timeZone': config.TIMEZONE,
-            },
-            'colorId': color_id
-        }
-
+        event = build_event(summary, start_time, end_time, utility, description)
         created_event = service.events().insert(calendarId='primary', body=event).execute()
         return created_event.get('htmlLink')
     except CalendarUnavailable as e:

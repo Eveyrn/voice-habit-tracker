@@ -1,7 +1,9 @@
-﻿import asyncio
+﻿import os
+import asyncio
 import logging
 import pytz
 from datetime import datetime
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,8 +11,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import config
 from bot.handlers import (
     router, BOT_COMMANDS, ADMIN_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION,
-    day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about,
+    day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about, oauth_callback,
 )
+from services import google_oauth
 from database.db_manager import (
     init_db, get_or_create_profile, cleanup_old_reminders,
     get_due_reminders, mark_reminder_sent, pop_snoozed_reminders,
@@ -103,6 +106,24 @@ async def set_commands(bot: Bot):
         logging.error(f"Не удалось поставить меню команд: {e}")
 
 
+async def start_web(bot: Bot):
+    """Маленький веб-сервер на том же процессе: сюда Google возвращает человека после входа (/calendar).
+    Хостинг пробрасывает свой HTTPS-домен на SERVER_PORT."""
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    app.router.add_get(google_oauth.CALLBACK_PATH, oauth_callback)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("SERVER_PORT", "8080"))
+    try:
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        logging.info(f"Веб-адрес для входа в Google слушает порт {port} ({google_oauth.redirect_uri() if google_oauth.enabled() else 'PUBLIC_URL не задан'})")
+    except OSError as e:
+        # Порт занят (например, локальный запуск) — бот работает дальше, просто без /calendar
+        logging.error(f"Не удалось открыть порт {port}: {e}")
+
+
 async def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env файле!")
@@ -128,6 +149,7 @@ async def main():
     scheduler.start()
     logging.info("Планировщик запущен (11:00, 16:00, 21:30, напоминания раз в минуту).")
 
+    await start_web(bot)
     await set_commands(bot)
     logging.info(f"Бот запущен. Пользователей по заявкам: {len(all_user_ids()) - len(config.ALLOWED_USER_IDS)}")
     await dp.start_polling(bot)

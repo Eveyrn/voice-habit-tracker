@@ -111,6 +111,16 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Google Календарь каждого пользователя (его собственный аккаунт): ключ и id календаря «Трекер дня».
+        # В бэкап НЕ попадает (см. backup_bytes) — после восстановления люди просто переподключатся.
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS google_calendars (
+                user_id INTEGER PRIMARY KEY,
+                token TEXT,
+                calendar_id TEXT,
+                connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         # Записи (одно сообщение = одна запись): что из него создано — для «Отменить» и для поправок
         await db.execute('''
             CREATE TABLE IF NOT EXISTS entries (
@@ -395,6 +405,10 @@ def backup_bytes() -> bytes:
     src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(tmp_path)
     try:
         src.backup(dst)
+        # Ключи доступа к чужим Google-аккаунтам в файл, который пересылается в Telegram, не кладём
+        dst.execute("DELETE FROM google_calendars")
+        dst.commit()
+        dst.execute("VACUUM")
     finally:
         dst.close()
         src.close()
@@ -427,14 +441,16 @@ async def _recount_patterns(db, user_id, titles):
             await db.execute('DELETE FROM patterns WHERE user_id = ? AND title = ?', (user_id, t))
 
 async def delete_items(user_id, activity_ids=(), task_ids=(), reminder_ids=()):
-    """Удаляет дела/задачи/напоминания пользователя по id. Возвращает число удалённых дел."""
+    """Удаляет дела/задачи/напоминания пользователя по id.
+    Возвращает список calendar_event_id удалённых дел (длина = сколько дел удалено), чтобы убрать их и из Google."""
     activity_ids, task_ids, reminder_ids = list(activity_ids), list(task_ids), list(reminder_ids)
     async with aiosqlite.connect(DB_PATH) as db:
-        titles = []
+        titles, event_ids = [], []
         if activity_ids:
             marks = ",".join("?" * len(activity_ids))
-            async with db.execute(f'SELECT title FROM activities WHERE user_id = ? AND id IN ({marks})', (user_id, *activity_ids)) as cursor:
-                titles = [r[0] for r in await cursor.fetchall()]
+            async with db.execute(f'SELECT title, calendar_event_id FROM activities WHERE user_id = ? AND id IN ({marks})', (user_id, *activity_ids)) as cursor:
+                rows = await cursor.fetchall()
+            titles, event_ids = [r[0] for r in rows], [r[1] for r in rows]
             await db.execute(f'DELETE FROM activities WHERE user_id = ? AND id IN ({marks})', (user_id, *activity_ids))
         if task_ids:
             await db.execute(f'DELETE FROM tasks WHERE user_id = ? AND id IN ({",".join("?" * len(task_ids))})', (user_id, *task_ids))
@@ -442,7 +458,7 @@ async def delete_items(user_id, activity_ids=(), task_ids=(), reminder_ids=()):
             await db.execute(f'DELETE FROM reminders WHERE user_id = ? AND id IN ({",".join("?" * len(reminder_ids))})', (user_id, *reminder_ids))
         await _recount_patterns(db, user_id, titles)
         await db.commit()
-    return len(titles)
+    return event_ids
 
 async def undo_entry(user_id, act_from, act_to, task_from, task_to):
     """Старые кнопки «Отменить» (диапазоны id). Возвращает True, если что-то ушло в календарь."""
@@ -483,8 +499,31 @@ async def update_activity(activity_id, user_id, **fields):
         await db.execute(f'UPDATE activities SET {sets} WHERE id = ? AND user_id = ?', (*allowed.values(), activity_id, user_id))
         await _recount_patterns(db, user_id, [old_title, allowed.get("title")])
         await db.commit()
-        async with db.execute('SELECT id, title, utility, category, duration_min, start_time, end_time FROM activities WHERE id = ?', (activity_id,)) as cursor:
+        async with db.execute('SELECT id, title, utility, category, duration_min, start_time, end_time, calendar_event_id FROM activities WHERE id = ?', (activity_id,)) as cursor:
             return await cursor.fetchone()
+
+# ---------- Google Календарь пользователя ----------
+
+async def get_google(user_id):
+    """{"token": {...}, "calendar_id": ...} или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT token, calendar_id FROM google_calendars WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    return {"token": json.loads(row[0]), "calendar_id": row[1]} if row else None
+
+async def save_google(user_id, token: dict, calendar_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO google_calendars (user_id, token, calendar_id) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET token = excluded.token, calendar_id = excluded.calendar_id,
+                connected_at = CURRENT_TIMESTAMP
+        ''', (user_id, json.dumps(token), calendar_id))
+        await db.commit()
+
+async def delete_google(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM google_calendars WHERE user_id = ?', (user_id,))
+        await db.commit()
 
 async def get_task(task_id, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -543,7 +582,7 @@ async def active_user_ids():
 async def delete_user_data(user_id):
     """Стирает все записи человека (сам доступ остаётся)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        for table in ("activities", "tasks", "habits", "patterns", "reminders", "entries", "settings", "user_profile"):
+        for table in ("activities", "tasks", "habits", "patterns", "reminders", "entries", "settings", "user_profile", "google_calendars"):
             await db.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
         await db.commit()
 

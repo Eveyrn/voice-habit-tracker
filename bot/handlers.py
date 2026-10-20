@@ -1,18 +1,23 @@
 ﻿import os
 import re
+import time
+import secrets
 import pytz
 import asyncio
 from datetime import datetime, timedelta
+from aiohttp import web
 from aiogram import Router, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from google.auth.exceptions import RefreshError
 
 import config
 from database import db_manager
+from services import google_oauth
 from services.stt import transcribe_audio
 from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES
-from services.calendar_api import add_event
+from services.calendar_api import add_event, build_event
 
 router = Router()
 
@@ -24,6 +29,7 @@ BOT_COMMANDS = [
     ("habits", "Привычки и серии"),
     ("reminders", "Мои напоминания"),
     ("remind", "Новое напоминание: /remind 10:00 Витамины"),
+    ("calendar", "Подключить свой Google Календарь"),
     ("limit", "Стоп-сигнал на телефон"),
     ("about", "Рассказать о себе"),
     ("patterns", "Повторяющиеся дела"),
@@ -191,9 +197,9 @@ def welcome_text(user_id: int, profile: dict) -> str:
         "Я собираю статистику твоего ритма; разбор и предложение расписания — по /plan "
         "(точнее всего через 1–3 недели записей).\n\n"
     )
-    if user_id == config.OWNER_ID:
-        text += "После 3 недель дела начнут попадать в Google Календарь (он же виден в Samsung / Redmi).\n\n"
-    else:
+    text += ("📅 /calendar — подключить свой Google Календарь: дела будут появляться в нём "
+             "(и на телефоне — Samsung, Redmi, iPhone).\n\n")
+    if user_id != config.OWNER_ID:
         text += ("🔒 Записи видишь только ты в этом чате; хранятся они на сервере владельца бота. "
                  "Стереть всё — /deleteme.\n"
                  "Расскажи о себе одной фразой — так я лучше пойму голосовые: /about\n\n")
@@ -254,11 +260,164 @@ async def cmd_deleteme(message: types.Message):
 @router.callback_query(F.data.startswith("delme_"))
 async def process_deleteme(callback: types.CallbackQuery):
     if callback.data == "delme_yes":
+        google = await db_manager.get_google(callback.from_user.id)
+        if google:
+            await asyncio.to_thread(google_oauth.revoke, google["token"])
         await db_manager.delete_user_data(callback.from_user.id)
         await callback.message.edit_text("Готово: все твои данные стёрты. Можно начинать с чистого листа.")
     else:
         await callback.message.edit_text("Ок, ничего не трогаю.")
     await callback.answer()
+
+
+# ---------- Google Календарь каждого пользователя ----------
+
+OAUTH_STATE_TTL = 15 * 60  # ссылка на вход живёт 15 минут
+
+
+class CalendarLost(Exception):
+    """Человек отозвал доступ в своём Google — ключ больше не работает."""
+
+
+@router.message(Command("calendar"))
+async def cmd_calendar(message: types.Message):
+    if not check_auth(message.from_user.id):
+        await deny(message)
+        return
+    uid = message.from_user.id
+    if not google_oauth.enabled():
+        await message.answer("Подключение Google Календаря ещё не настроено владельцем бота — скоро будет.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    if await db_manager.get_google(uid):
+        builder.button(text="Отключить календарь", callback_data="gcal_off")
+        await message.answer(
+            f"✅ Google Календарь подключён: дела появляются в календаре «{google_oauth.CALENDAR_NAME}».\n"
+            "На телефоне: в приложении календаря включи этот календарь в списке, если его не видно.",
+            reply_markup=builder.as_markup())
+        return
+
+    nonce = secrets.token_urlsafe(16)
+    await db_manager.set_setting(uid, "oauth_state", f"{nonce}|{int(time.time())}")
+    builder.button(text="📅 Подключить Google Календарь", url=google_oauth.auth_url(f"{uid}.{nonce}"))
+    await message.answer(
+        "Дела будут появляться в твоём Google Календаре — в отдельном календаре "
+        f"«{google_oauth.CALENDAR_NAME}». Остальной календарь бот не видит и не трогает.\n\n"
+        "Нажми кнопку, выбери свой Google-аккаунт и разреши доступ.\n"
+        "• Если Google напишет «приложение не проверено» — нажми «Дополнительно» → «Перейти». "
+        "Это небольшой личный бот, у него нет проверки Google.\n"
+        "• Если Google покажет ошибку «disallowed_useragent» — открой ссылку в обычном браузере (⋮ → «Открыть в браузере»).\n\n"
+        "Ссылка действует 15 минут.",
+        reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data == "gcal_off")
+async def process_calendar_off(callback: types.CallbackQuery):
+    google = await db_manager.get_google(callback.from_user.id)
+    if google:
+        await asyncio.to_thread(google_oauth.revoke, google["token"])
+        await db_manager.delete_google(callback.from_user.id)
+    await callback.answer("Отключено")
+    await callback.message.edit_text(
+        f"Календарь отключён, бот больше туда не пишет. Сам календарь «{google_oauth.CALENDAR_NAME}» остался "
+        "в твоём Google — можно удалить его вручную. Подключить снова — /calendar")
+
+
+def _page(text: str, status: int = 200):
+    html = ("<!doctype html><html lang='ru'><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'><title>Трекер дня</title>"
+            "<body style='font-family:system-ui,sans-serif;max-width:480px;margin:15vh auto;padding:0 16px;"
+            "text-align:center;background:#f6f7f9;color:#111'>"
+            f"<p style='font-size:22px;line-height:1.4'>{text}</p>"
+            "<p style='color:#777'>Эту страницу можно закрыть и вернуться в Telegram.</p></body></html>")
+    return web.Response(text=html, content_type="text/html", status=status)
+
+
+async def oauth_callback(request: web.Request):
+    """Сюда Google возвращает человека после «Разрешить»: PUBLIC_URL/oauth/google?code=…&state=…"""
+    bot = request.app["bot"]
+    state, code, error = request.query.get("state", ""), request.query.get("code"), request.query.get("error")
+    try:
+        uid_str, nonce = state.split(".", 1)
+        uid = int(uid_str)
+    except ValueError:
+        return _page("Ссылка неправильная. Нажми /calendar в боте ещё раз.", 400)
+
+    saved = await db_manager.get_setting(uid, "oauth_state", "")
+    saved_nonce, _, saved_at = (saved or "").partition("|")
+    if not saved_nonce or saved_nonce != nonce or time.time() - float(saved_at or 0) > OAUTH_STATE_TTL:
+        return _page("Ссылка устарела. Нажми /calendar в боте ещё раз.", 400)
+    await db_manager.set_setting(uid, "oauth_state", "")  # ссылка одноразовая
+
+    if error or not code:
+        await _notify(bot, uid, "Календарь не подключён: доступ не разрешили. Попробовать снова — /calendar")
+        return _page("Доступ не разрешён — календарь не подключён.")
+
+    try:
+        token = await asyncio.to_thread(google_oauth.exchange_code, code)
+        old_calendar = await db_manager.get_setting(uid, "google_calendar_id")
+        calendar_id = await asyncio.to_thread(google_oauth.ensure_calendar, token, old_calendar)
+    except PermissionError:
+        await _notify(bot, uid, "Календарь не подключён: при входе не отметили галочку доступа к календарю. "
+                                "Нажми /calendar и оставь галочку.")
+        return _page("Не хватает разрешения на календарь — попробуй ещё раз и оставь галочку.")
+    except Exception as e:
+        print(f"[oauth] {uid}: {e}")
+        await _notify(bot, uid, "Не получилось подключить календарь — попробуй ещё раз через минуту: /calendar")
+        return _page("Что-то пошло не так. Попробуй ещё раз из бота.", 500)
+
+    await db_manager.save_google(uid, token, calendar_id)
+    await db_manager.set_setting(uid, "google_calendar_id", calendar_id)
+    await _notify(bot, uid,
+                  f"✅ Google Календарь подключён! Новые дела будут появляться в календаре «{google_oauth.CALENDAR_NAME}».\n"
+                  "На телефоне: если его не видно — включи этот календарь в настройках приложения календаря.")
+    return _page("✅ Календарь подключён!")
+
+
+async def _notify(bot, user_id: int, text: str):
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"[notify] {user_id}: {e}")
+
+
+async def push_event(user_id: int, google: dict, title, start_time, end_time, utility, description):
+    """Событие в личный календарь человека. id события или None; CalendarLost, если доступ отозван."""
+    event = build_event(title, start_time, end_time, utility, description)
+    try:
+        return await asyncio.to_thread(google_oauth.insert_event, google["token"], google["calendar_id"], event)
+    except RefreshError:
+        await db_manager.delete_google(user_id)
+        raise CalendarLost()
+    except Exception as e:
+        print(f"[calendar] {user_id}: {e}")
+        return None
+
+
+async def drop_events(user_id: int, event_ids):
+    """Убрать из Google события удалённых дел."""
+    google = await db_manager.get_google(user_id)
+    for event_id in event_ids or []:
+        if google and event_id:
+            try:
+                await asyncio.to_thread(google_oauth.delete_event, google["token"], google["calendar_id"], event_id)
+            except Exception as e:
+                print(f"[calendar] удаление {event_id}: {e}")
+
+
+async def patch_event(user_id: int, row):
+    """После поправки дела — поправить и событие в Google."""
+    _, title, utility, _, _, start, end, event_id = row
+    google = await db_manager.get_google(user_id)
+    if not (google and event_id):
+        return
+    event = build_event(title, start, end, utility)
+    fields = {k: event[k] for k in ("summary", "start", "end", "colorId")}
+    try:
+        await asyncio.to_thread(google_oauth.patch_event, google["token"], google["calendar_id"], event_id, fields)
+    except Exception as e:
+        print(f"[calendar] правка {event_id}: {e}")
 
 
 # ---------- Стоп-сигнал на телефон ----------
@@ -757,11 +916,14 @@ async def apply_edits(user_id: int, edits: list, now: datetime) -> list[str]:
                     fields["utility"] = None
                 row = await db_manager.update_activity(item_id, user_id, **fields)
                 if row:
-                    _, title, _, _, duration, start, end = row
+                    _, title, _, _, duration, start, end, _ = row
+                    await patch_event(user_id, row)
                     out.append(f"✏️ Исправлено: {_hm(start)}–{_hm(end)} {title} · {_fmt_min(duration)}")
 
             elif op == "activity_delete":
-                if await db_manager.delete_items(user_id, activity_ids=[item_id]):
+                event_ids = await db_manager.delete_items(user_id, activity_ids=[item_id])
+                if event_ids:
+                    await drop_events(user_id, event_ids)
                     out.append("🗑 Дело удалено")
 
             elif op == "task_delete":
@@ -823,10 +985,12 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             await status_msg.edit_text(_join(lines))
             return
 
-        # 3. Дела
+        # 3. Дела. Календарь: свой Google человека (/calendar) — сразу; у владельца без /calendar —
+        # старый путь (token.json) после 3 недель наблюдения
         is_owner = user_id == config.OWNER_ID
-        calendar_on = is_owner and profile["phase"] == "coaching"
-        calendar_ok = True
+        google = await db_manager.get_google(user_id) if google_oauth.enabled() else None
+        legacy_calendar = not google and is_owner and profile["phase"] == "coaching"
+        calendar_ok, calendar_lost = True, False
         for act in activities:
             title = act.get("title") or "Дело"
             utility = act.get("utility") if act.get("utility") in UTILITY_LABEL else "routine"
@@ -837,13 +1001,22 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             except (TypeError, ValueError):
                 duration = 30
 
-            if calendar_on:
+            event_id = None
+            description = f"Категория: {category} | Из трекера дня"
+            if google and not calendar_lost:
+                try:
+                    event_id = await push_event(user_id, google, title, start_time, end_time, utility, description)
+                    calendar_ok = calendar_ok and bool(event_id)
+                except CalendarLost:
+                    calendar_lost = True
+            elif legacy_calendar:
                 link = await asyncio.to_thread(add_event, summary=title, start_time=start_time, end_time=end_time,
-                                               utility=utility, description=f"Категория: {category} | Из трекера дня")
+                                               utility=utility, description=description)
                 calendar_ok = calendar_ok and bool(link)
 
             activity_id = await db_manager.add_activity(user_id=user_id, title=title, category=category, utility=utility,
-                                                        duration_min=duration, start_time=start_time, end_time=end_time)
+                                                        duration_min=duration, start_time=start_time, end_time=end_time,
+                                                        calendar_event_id=event_id)
             await db_manager.record_pattern(user_id=user_id, title=title, utility=utility, date_str=today_date)
 
             time_label = f"{_hm(start_time)}–{_hm(end_time)} " if _hm(start_time) and _hm(end_time) else ""
@@ -851,13 +1024,12 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             created["a"].append(activity_id)
             created["summary"].append(f"дело #{activity_id}: {time_label}{title}")
 
-        if activities and is_owner:
-            if profile["phase"] != "coaching":
-                left = max(0, profile["target_days"] - profile["days_passed"] + 1)
-                lines.append(f"📥 Сохранено в профиль наблюдения (календарь подключится через {left} дн.)")
-            else:
+        if activities:
+            if calendar_lost:
+                lines.append("⚠️ Доступ к Google Календарю отозван — подключи заново: /calendar")
+            elif google or legacy_calendar:
                 lines.append("📅 Добавлено в Google Календарь" if calendar_ok else
-                             "📥 Сохранено в боте (Google Календарь сейчас недоступен)")
+                             "📥 Сохранено в боте (Google Календарь сейчас не ответил)")
 
         # 4. Задачи
         if analysis["tasks_to_add"]:
@@ -933,10 +1105,12 @@ async def process_undo(callback: types.CallbackQuery):
         await callback.answer("Эту запись уже не отменить")
         return
     data = entry[2]
-    deleted = await db_manager.delete_items(callback.from_user.id, data.get("a", []), data.get("t", []), data.get("r", []))
+    event_ids = await db_manager.delete_items(callback.from_user.id, data.get("a", []), data.get("t", []), data.get("r", []))
+    await drop_events(callback.from_user.id, event_ids)
     await callback.answer("Запись отменена")
     note = "\n\n↩️ Отменено — дела, задачи и напоминания из этой записи удалены."
-    if deleted and callback.from_user.id == config.OWNER_ID and await db_manager._phase(callback.from_user.id) == "coaching":
+    if any(e is None for e in event_ids) and callback.from_user.id == config.OWNER_ID \
+            and await db_manager._phase(callback.from_user.id) == "coaching" and not await db_manager.get_google(callback.from_user.id):
         note += "\nСобытия в Google Календаре удали вручную."
     await callback.message.edit_text((callback.message.text or "") + note)
 
