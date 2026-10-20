@@ -90,6 +90,11 @@ CASES = [
      lambda r, now: None if r["habit_identified"] == "Выпить витамины" and not acts(r)
      else f"ждали привычку «Выпить витамины» без дела: habit={r['habit_identified']} acts={acts(r)}"),
 
+    ("Завтра купить корм коту, сегодня позвонить в банк, и когда-нибудь помыть машину", "",
+     lambda r, now: None if len(r["tasks_to_add"]) == 3
+     and {t["due"] for t in r["tasks_to_add"]} == {(now + timedelta(days=1)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"), None}
+     else f"ждали 3 задачи: завтра / сегодня / без срока: {r['tasks_to_add']}"),
+
     ("Сегодня что у нас?", CONTEXT_HABIT,
      lambda r, now: None if r["intent"] == "question" and r["answer"] and not acts(r)
      else f"ждали вопрос с ответом: intent={r['intent']} answer={r['answer']!r}"),

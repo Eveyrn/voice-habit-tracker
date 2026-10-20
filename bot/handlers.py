@@ -18,7 +18,7 @@ from database import db_manager
 from services import google_oauth
 from services.stt import transcribe_audio
 import groq
-from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES, PRIMARY_MODEL, QUOTA as ai_quota
+from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES, PRIMARY_MODEL, QUOTA as ai_quota,     LIMIT_HIT as ai_limit
 from services.calendar_api import add_event, build_event
 
 router = Router()
@@ -770,17 +770,56 @@ async def cmd_patterns(message: types.Message):
     await message.answer(text)
 
 
+def _due_label(due: str | None, today: str) -> str:
+    """« (сегодня)», « (завтра)», « (до 24.10)», « (просрочено, 18.10)» или пусто."""
+    if not due:
+        return ""
+    try:
+        d, t = datetime.strptime(due, "%Y-%m-%d").date(), datetime.strptime(today, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    if d < t:
+        return f" (просрочено, {d.strftime('%d.%m')})"
+    if d == t:
+        return " (сегодня)"
+    if d == t + timedelta(days=1):
+        return " (завтра)"
+    return f" (до {d.strftime('%d.%m')})"
+
+
+TODO_GROUPS = [("⚠️ Просрочено", lambda d, t: d and d < t), ("Сегодня", lambda d, t: d == t),
+               ("Завтра", lambda d, t: d and d == _plus_day(t)), ("Позже", lambda d, t: d and d > _plus_day(t)),
+               ("Без срока", lambda d, t: not d)]
+
+
+def _plus_day(day: str) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 async def _todo_view(user_id: int):
     tasks = await db_manager.get_pending_tasks(user_id)
     if not tasks:
         return "🎉 Открытых задач нет!", None
+    today = _now_local().strftime("%Y-%m-%d")
     builder = InlineKeyboardBuilder()
-    text = "📋 Задачи:\n\n"
-    for task_id, title, _ in tasks:
-        text += f"- {title}\n"
-        builder.button(text=f"✅ {title[:28]}", callback_data=f"done_{task_id}")
+    text = "📋 Задачи\n"
+    for group, belongs in TODO_GROUPS:
+        items = [(t_id, title, due) for t_id, title, due in tasks if belongs(due, today)]
+        if not items:
+            continue
+        text += f"\n{group}:\n"
+        for task_id, title, due in sorted(items, key=lambda x: x[2] or ""):
+            label = f" ({datetime.strptime(due, '%Y-%m-%d').strftime('%d.%m')})" if due and group in ("Позже", "⚠️ Просрочено") else ""
+            text += f"- {title}{label}\n"
+            builder.button(text=f"✅ {title[:28]}", callback_data=f"done_{task_id}")
     builder.adjust(1)
     return text, builder.as_markup()
+
+
+async def tasks_for_morning(user_id: int, today: str) -> list[str]:
+    """Задачи на сегодня и просроченные — для утреннего сообщения."""
+    return [f"{title}{_due_label(due, today) if due != today else ''}"
+            for _, title, due in await db_manager.get_pending_tasks(user_id) if due and due <= today]
 
 
 @router.message(Command("todo"))
@@ -865,7 +904,7 @@ async def day_report(user_id: int, today_str: str) -> str:
 
     tasks = await db_manager.get_pending_tasks(user_id)
     if tasks:
-        shown = "\n".join(f"- {title}" for _, title, _ in tasks[:5])
+        shown = "\n".join(f"- {title}{_due_label(due, today_str)}" for _, title, due in tasks[:5])
         more = f"\n…и ещё {len(tasks) - 5}" if len(tasks) > 5 else ""
         lines.append(f"\nОткрытые задачи ({len(tasks)}):\n{shown}{more}")
 
@@ -965,7 +1004,7 @@ async def build_context(user_id: int, now: datetime) -> str:
     tasks = await db_manager.get_pending_tasks(user_id)
     if tasks:
         lines.append("Открытые задачи:")
-        lines.extend(f"- задача #{t_id}: {title}" for t_id, title, _ in tasks[:30])
+        lines.extend(f"- задача #{t_id}: {title}{_due_label(due, today)}" for t_id, title, due in tasks[:30])
 
     reminders = await db_manager.get_reminders(user_id, from_date=today)
     if reminders:
@@ -1018,11 +1057,21 @@ async def apply_edits(user_id: int, edits: list, now: datetime) -> list[str]:
                     out.append(f"✏️ Напоминание «{text}»: {format_when(updated[2], updated[3])}{once}")
 
             elif op == "activity_update":
-                fields = {k: e.get(k) for k in ("title", "start_time", "end_time", "utility", "category")}
+                current = await db_manager.get_activity(item_id, user_id)
+                if not current:
+                    continue
+                fields = {k: e.get(k) for k in ("title", "utility", "category")}
                 if fields["category"] and fields["category"] not in CATEGORIES:
                     fields["category"] = None
                 if fields["utility"] not in ("productive", "routine", "unproductive"):
                     fields["utility"] = None
+                # Время модель присылает как «15:00» (так её учит подсказка) — достраиваем дату самого дела
+                start, end = _edit_time(e.get("start") or e.get("start_time"), current[5]), \
+                    _edit_time(e.get("end") or e.get("end_time"), current[6])
+                if start and end and end <= start:
+                    end += timedelta(days=1)
+                fields["start_time"] = start.isoformat(timespec="seconds") if start else None
+                fields["end_time"] = end.isoformat(timespec="seconds") if end else None
                 row = await db_manager.update_activity(item_id, user_id, **fields)
                 if row:
                     _, title, _, _, duration, start, end, _ = row
@@ -1057,6 +1106,19 @@ async def period_note(user_id: int, now: datetime) -> str:
     shown = ", ".join(datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m") for d in days[:10])
     more = f" и ещё {len(days) - 10}" if len(days) > 10 else ""
     return f"\nℹ️ Считаю по записям за {len(days)} {_days_word(len(days))}: {shown}{more}. За другие дни записей нет."
+
+
+def _edit_time(value, current_iso):
+    """Время из поправки: «15:00» (на дату дела) или полная дата. None — не меняется."""
+    if not value:
+        return None
+    m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", str(value).strip())
+    if m:
+        base = _parse_dt(current_iso) or _now_local().replace(tzinfo=None)
+        if int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            return None
+        return base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+    return _parse_dt(value)
 
 
 def _parse_dt(value):
@@ -1226,10 +1288,13 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         if analysis["tasks_to_add"]:
             lines.append("\n📋 В задачи:")
             for t in analysis["tasks_to_add"]:
-                task_id = await db_manager.add_task(user_id, t)
+                if isinstance(t, str):  # старый формат — на всякий случай
+                    t = {"text": t, "due": None}
+                task_id = await db_manager.add_task(user_id, t["text"], t.get("due"))
+                due = _due_label(t.get("due"), today_date)
                 created["t"].append(task_id)
-                created["summary"].append(f"задача #{task_id}: {t}")
-                lines.append(f"- {t}")
+                created["summary"].append(f"задача #{task_id}: {t['text']}{due}")
+                lines.append(f"- {t['text']}{due}")
 
         # 5. Привычка: привязываем к ежедневному напоминанию, иначе «Витамины» и «Выпить витамины» — разные
         # привычки, отметка в итогах дня не появится, а напоминание всё равно придёт
@@ -1287,6 +1352,8 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
 
         if created["a"] or created["t"] or created["r"]:
             entry_id = await db_manager.add_entry(user_id, transcript, created, now.replace(tzinfo=None).isoformat())
+            if created["a"]:
+                builder.button(text="✏️ Поправить время", callback_data=f"ed_{entry_id}")
             builder.button(text="↩️ Отменить запись", callback_data=f"undo2_{entry_id}")
         builder.button(text=FEEDBACK_LABEL, callback_data="fb")
         builder.adjust(1)
@@ -1302,6 +1369,84 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         import traceback
         traceback.print_exc()
         await status_msg.edit_text(f"Ошибка обработки: {str(e)[:200]}")
+
+
+# ---------- Пробелы в дне ----------
+
+GAP_MIN = 90                 # о дырах короче полутора часов не спрашиваем
+GAP_DAY_START = (9, 0)       # раньше 9 утра не считаем пробелом (сон)
+GAP_KINDS = {
+    "w": ("Работа/учёба", "Работа", "productive", "💼 Работа/учёба"),
+    "p": ("Залипание в телефоне", "Телефон", "unproductive", "📱 Телефон"),
+    "r": ("Отдых", "Отдых", "routine", "🛋 Отдых"),
+    "d": ("Дела и дорога", "Быт", "routine", "🚶 Дела/дорога"),
+}
+
+
+async def find_gaps(user_id: int, now: datetime, limit: int = 2) -> list[tuple[datetime, datetime]]:
+    """Самые большие незаписанные промежутки за сегодня (с 9:00 или с первого дела до «сейчас»)."""
+    today = now.strftime("%Y-%m-%d")
+    naive_now = now.replace(tzinfo=None)
+    intervals = []
+    for _, _, _, _, _, start, end in await db_manager.get_activities_for_day(user_id, today):
+        s, e = _parse_dt(start), _parse_dt(end)
+        if s and e and e > s:
+            intervals.append((s, min(e, naive_now)))
+    if not intervals:
+        return []  # за день ничего не записано — спрашивать «что было с 9 до 21» бессмысленно
+    day_start = naive_now.replace(hour=GAP_DAY_START[0], minute=GAP_DAY_START[1], second=0, microsecond=0)
+    cursor = min(day_start, min(s for s, _ in intervals))
+    gaps = []
+    for s, e in sorted(intervals):
+        if s - cursor >= timedelta(minutes=GAP_MIN):
+            gaps.append((cursor, s))
+        cursor = max(cursor, e)
+    if naive_now - cursor >= timedelta(minutes=GAP_MIN):
+        gaps.append((cursor, naive_now))
+    gaps = sorted(gaps, key=lambda g: g[1] - g[0], reverse=True)[:limit]
+    return sorted(gaps)
+
+
+def gap_keyboard(start: datetime, end: datetime):
+    stamp = f"{start.strftime('%Y%m%d%H%M')}_{end.strftime('%H%M')}"
+    builder = InlineKeyboardBuilder()
+    for key, (_, _, _, label) in GAP_KINDS.items():
+        builder.button(text=label, callback_data=f"gap_{stamp}_{key}")
+    builder.button(text="🤷 Неважно", callback_data=f"gap_{stamp}_x")
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+async def ask_gaps(bot, user_id: int, now: datetime):
+    for start, end in await find_gaps(user_id, now):
+        await _notify_markup(bot, user_id, f"🕳 С {start.strftime('%H:%M')} до {end.strftime('%H:%M')} ничего не записано — "
+                                           "что было?", gap_keyboard(start, end))
+
+
+@router.callback_query(F.data.startswith("gap_"))
+async def process_gap(callback: types.CallbackQuery):
+    _, stamp, end_hm, key = callback.data.split("_")
+    start = datetime.strptime(stamp, "%Y%m%d%H%M")
+    end = start.replace(hour=int(end_hm[:2]), minute=int(end_hm[2:]))
+    await callback.answer()
+    if key == "x" or key not in GAP_KINDS:
+        await callback.message.edit_text(f"Ок, {start.strftime('%H:%M')}–{end.strftime('%H:%M')} пропускаю.")
+        return
+    title, category, utility, _ = GAP_KINDS[key]
+    user_id = callback.from_user.id
+    start_iso, end_iso = start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
+    event_id, google = None, (await db_manager.get_google(user_id) if google_oauth.enabled() else None)
+    if google:
+        try:
+            event_id = await push_event(user_id, google, title, start_iso, end_iso, utility, f"Категория: {category} | Из трекера дня")
+        except CalendarLost:
+            pass
+    await db_manager.add_activity(user_id=user_id, title=title, category=category, utility=utility,
+                                  duration_min=int((end - start).total_seconds() // 60),
+                                  start_time=start_iso, end_time=end_iso, calendar_event_id=event_id)
+    await db_manager.record_pattern(user_id=user_id, title=title, utility=utility, date_str=start.strftime("%Y-%m-%d"))
+    await callback.message.edit_text(f"✅ Записал: {start.strftime('%H:%M')}–{end.strftime('%H:%M')} {title} · "
+                                     f"{_fmt_min((end - start).total_seconds() // 60)}")
 
 
 # ---------- Квота бесплатного Groq ----------
@@ -1321,12 +1466,100 @@ async def quota_watch(bot, rate_limited: str | None = None):
                                   "(команды работают). Если так будет часто — можно уменьшить DAILY_ENTRY_LIMIT или "
                                   "перейти на платный тариф Groq.")
         return
+    if time.time() - ai_limit["primary_day"] < 3600 and await db_manager.get_setting(owner, "quota_primary") != today:
+        await db_manager.set_setting(owner, "quota_primary", today)
+        await _notify(bot, owner, "⚠️ Основная модель исчерпала дневной лимит токенов Groq (200 000 в сутки, это примерно "
+                                  "60 сообщений). Бот продолжает работать на запасной модели — она чуть менее точна. "
+                                  "Лимит восстанавливается постепенно в течение суток.")
     quota = ai_quota.get(PRIMARY_MODEL)
     if quota and quota["limit"] and quota["left"] / quota["limit"] < QUOTA_WARN_SHARE \
             and await db_manager.get_setting(owner, "quota_low") != today:
         await db_manager.set_setting(owner, "quota_low", today)
         await _notify(bot, owner, f"⚠️ Квота Groq на исходе: осталось {quota['left']} из {quota['limit']} запросов "
                                   "на сегодня. Когда кончится, бот будет отвечать «лимит исчерпан» до завтра.")
+
+
+# ---------- Правка времени кнопками ----------
+
+EDIT_STEP_MIN = 15
+
+
+def _editor(row):
+    a_id, title, _, _, duration, start, end, _ = row
+    builder = InlineKeyboardBuilder()
+    for label, field, delta in (("◀ начало −15", "s", -EDIT_STEP_MIN), ("начало +15 ▶", "s", EDIT_STEP_MIN),
+                                ("◀ конец −15", "e", -EDIT_STEP_MIN), ("конец +15 ▶", "e", EDIT_STEP_MIN)):
+        builder.button(text=label, callback_data=f"et_{a_id}_{field}_{delta}")
+    builder.button(text="✅ Готово", callback_data=f"etok_{a_id}")
+    builder.adjust(2, 2, 1)
+    text = (f"✏️ {_hm(start)}–{_hm(end)} {title} · {_fmt_min(duration)}\n\n"
+            "Двигай начало и конец кнопками. Или просто напиши, как было: «это было с 9 до 10».")
+    return text, builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("ed_"))
+async def process_edit_entry(callback: types.CallbackQuery):
+    entry = await db_manager.get_entry(int(callback.data.split("_")[1]), callback.from_user.id)
+    rows = [r for a_id in (entry[2].get("a", []) if entry else [])
+            if (r := await db_manager.get_activity(a_id, callback.from_user.id))]
+    await callback.answer()
+    if not rows:
+        await callback.message.answer("Эти дела уже удалены.")
+        return
+    if len(rows) == 1:
+        text, markup = _editor(rows[0])
+        await callback.message.answer(text, reply_markup=markup)
+        return
+    builder = InlineKeyboardBuilder()
+    for a_id, title, _, _, _, start, end, _ in rows:
+        builder.button(text=f"{_hm(start)}–{_hm(end)} {title}"[:60], callback_data=f"eda_{a_id}")
+    builder.adjust(1)
+    await callback.message.answer("Какое дело поправить?", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("eda_"))
+async def process_edit_pick(callback: types.CallbackQuery):
+    row = await db_manager.get_activity(int(callback.data.split("_")[1]), callback.from_user.id)
+    await callback.answer()
+    if not row:
+        await callback.message.edit_text("Это дело уже удалено.")
+        return
+    text, markup = _editor(row)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("et_"))
+async def process_edit_time(callback: types.CallbackQuery):
+    _, a_id, field, delta = callback.data.split("_")
+    user_id = callback.from_user.id
+    row = await db_manager.get_activity(int(a_id), user_id)
+    if not row:
+        await callback.answer("Это дело уже удалено")
+        return
+    start, end = _parse_dt(row[5]), _parse_dt(row[6])
+    if not (start and end):
+        await callback.answer("У этого дела нет времени")
+        return
+    shift = timedelta(minutes=int(delta))
+    start, end = (start + shift, end) if field == "s" else (start, end + shift)
+    if end - start < timedelta(minutes=5):
+        await callback.answer("Короче уже некуда")
+        return
+    updated = await db_manager.update_activity(int(a_id), user_id, start_time=start.isoformat(timespec="seconds"),
+                                               end_time=end.isoformat(timespec="seconds"))
+    await callback.answer()
+    if updated:
+        await patch_event(user_id, updated)
+        text, markup = _editor(updated)
+        await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("etok_"))
+async def process_edit_done(callback: types.CallbackQuery):
+    row = await db_manager.get_activity(int(callback.data.split("_")[1]), callback.from_user.id)
+    await callback.answer("Сохранено")
+    if row:
+        await callback.message.edit_text(f"✅ {_hm(row[5])}–{_hm(row[6])} {row[1]} · {_fmt_min(row[4])}")
 
 
 # ---------- «👎 Бот ошибся» ----------

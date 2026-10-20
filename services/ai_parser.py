@@ -56,7 +56,7 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
       "part_of_day": null
     }}
   ],
-  "tasks_to_add": ["Купить корм коту"],
+  "tasks_to_add": [{{"text": "Купить корм коту", "due": "tomorrow"}}],
   "habit_identified": null,
   "reminders": [{{"text": "Быть у мамы", "time": "15:00", "repeat": "once", "date": "{today_date}", "kind": "event"}}],
   "edits": [{{"op": "reminder_once", "id": 12, "date": "{today_date}"}}],
@@ -95,7 +95,11 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
 «поспала с часу ночи до девяти» → {{"title": "Сон", "day": "today", "start": "01:00", "end": "09:00", "duration_min": null, "ended_ago_min": null, "part_of_day": null}}
 «потом пойду работать» → это будущее: НЕ дело. Если нет времени — в tasks_to_add.
 
-ЗАДАЧИ (tasks_to_add) — дела на будущее БЕЗ конкретного времени («купить корм коту»). Список строк.
+ЗАДАЧИ (tasks_to_add) — дела на будущее БЕЗ конкретного времени. Объекты {{"text": "…", "due": …}}:
+due — "today", "tomorrow" или "ГГГГ-ММ-ДД", если назван день («завтра купить корм коту» → "tomorrow",
+«в пятницу сдать отчёт» → дата пятницы); иначе null. text — без слов про день («Купить корм коту»).
+Каждое упомянутое дело на будущее — отдельная задача, даже без срока: «завтра купить корм, сегодня позвонить в банк
+и когда-нибудь помыть машину» → 3 задачи (due: tomorrow, today, null).
 
 ПРИВЫЧКИ. habit_identified — если пользователь сделал то, о чём у него есть ЕЖЕДНЕВНОЕ напоминание в ДАННЫХ
 («выпила витамины» ↔ напоминание «Выпить витамины»), впиши ТОЧНО текст этого напоминания. Иначе null.
@@ -118,7 +122,7 @@ SYSTEM_PROMPT = """Ты — помощник в Telegram-трекере дня. 
 - {{"op": "reminder_daily", "id": N}} — сделать ежедневным
 - {{"op": "reminder_time", "id": N, "time": "ЧЧ:ММ"}}
 - {{"op": "reminder_delete", "id": N}}
-- {{"op": "activity_update", "id": N, "title": "...", "start_time": "...", "end_time": "...", "utility": "...", "category": "..."}} — только изменённые поля
+- {{"op": "activity_update", "id": N, "title": "...", "start": "ЧЧ:ММ", "end": "ЧЧ:ММ", "utility": "...", "category": "..."}} — только изменённые поля
 - {{"op": "activity_delete", "id": N}}
 - {{"op": "task_delete", "id": N}}
 
@@ -135,7 +139,7 @@ encouragement — одна короткая живая фраза, только 
 # Бесплатный Groq: ~1000 запросов в день и ~8000 токенов в минуту на каждую модель.
 # QUOTA — что осталось по последнему ответу; LIMIT_HIT — во что упёрлись последний раз («day» / «minute»).
 QUOTA: dict = {}
-LIMIT_HIT: dict = {"kind": None, "at": 0.0}
+LIMIT_HIT: dict = {"kind": None, "at": 0.0, "primary_day": 0.0}
 
 
 def _remember_quota(model: str, headers):
@@ -296,6 +300,8 @@ async def _ask(messages: list):
             print(f"[ai_parser] {model}: лимит Groq: {e}")
             _remember_limit(e)
             limited_models.add(model)
+            if model == PRIMARY_MODEL and LIMIT_HIT["kind"] == "day":
+                LIMIT_HIT["primary_day"] = time.time()  # основная на сегодня всё — дальше работаем на запасной
         except Exception as e:
             print(f"[ai_parser] {model}{'' if as_json else ' (без json)'} упал: {e}")
     return None
@@ -410,7 +416,7 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
     data["activities"].sort(key=lambda a: a["start_time"])
 
     # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
-    data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
+    data["tasks_to_add"] = _clean_tasks(data.get("tasks_to_add"), now)
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
     data["reminders"] = _clean_reminders(data.get("reminders"), today_date, text)
     data["edits"] = _clean_edits(data.get("edits"))
@@ -418,6 +424,25 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
     data["answer"] = _as_text(data.get("answer")).replace("**", "")
     data["encouragement"] = _as_text(data.get("encouragement")) if data["intent"] == "log" else ""
     return data
+
+
+def _clean_tasks(raw, now: datetime) -> list:
+    """[{text, due}]: due — ГГГГ-ММ-ДД или None. Модель иногда присылает строки — тоже принимаем."""
+    result = []
+    for item in raw or []:
+        text = _as_text(item)
+        if not text:
+            continue
+        due = item.get("due") if isinstance(item, dict) else None
+        due = str(due or "").strip().lower()
+        if due == "today":
+            due = now.strftime("%Y-%m-%d")
+        elif due == "tomorrow":
+            due = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            due = _clean_date(due)
+        result.append({"text": text[0].upper() + text[1:], "due": due})
+    return result
 
 
 def _clean_time(value):

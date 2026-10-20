@@ -12,6 +12,7 @@ import config
 from bot.handlers import (
     router, BOT_COMMANDS, ADMIN_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION,
     day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about, oauth_callback,
+    ask_gaps, tasks_for_morning,
 )
 from services import google_oauth, web_pages
 from database.db_manager import (
@@ -39,12 +40,14 @@ async def send_to(bot: Bot, user_id: int, text: str, **kwargs):
 async def morning_checkin(bot: Bot):
     today = _today()
     for user_id in all_user_ids():
-        profile = await get_or_create_profile(user_id, today)
+        await get_or_create_profile(user_id, today)
         plans = await plans_for_day(user_id, today)
+        tasks = await tasks_for_morning(user_id, today)
         plans_text = ("Сегодня в планах:\n" + "\n".join(plans) + "\n\n") if plans else ""
+        tasks_text = ("Задачи на сегодня:\n" + "\n".join(f"- {t}" for t in tasks) + "\n\n") if tasks else ""
         await send_to(bot, user_id,
                       "☀️ Доброе утро!\n\n"
-                      f"{plans_text}"
+                      f"{plans_text}{tasks_text}"
                       "Какие планы на первую половину дня? Запиши голосовое или набросай задачи!")
 
 
@@ -62,6 +65,8 @@ async def evening_checkin(bot: Bot):
         await send_to(bot, user_id,
                       f"🌙 Добрый вечер!\n\n{report}\n\n"
                       "Расскажи в голосовом, как прошёл вечер и что ещё было перед сном!")
+        # Дыры в дне — кнопками, чтобы /plan строился не только на том, что вспомнилось
+        await ask_gaps(bot, user_id, datetime.now(pytz.timezone(config.TIMEZONE)))
 
 
 async def send_due_reminders(bot: Bot):

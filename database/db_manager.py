@@ -546,6 +546,15 @@ async def get_daily_totals(user_id, since_date):
         ''', (user_id, since_date)) as cursor:
             return await cursor.fetchall()
 
+async def get_activity(activity_id, user_id):
+    """(id, title, utility, category, duration_min, start_time, end_time, calendar_event_id) или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('''
+            SELECT id, title, utility, category, duration_min, start_time, end_time, calendar_event_id
+            FROM activities WHERE id = ? AND user_id = ?
+        ''', (activity_id, user_id)) as cursor:
+            return await cursor.fetchone()
+
 async def get_task(task_id, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT id, title FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id)) as cursor:
