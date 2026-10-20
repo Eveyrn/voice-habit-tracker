@@ -20,6 +20,8 @@ from database.db_manager import (
 )
 
 logging.basicConfig(level=logging.INFO)
+# Планировщик раз в минуту пишет «Running job … executed successfully» — в консоли хостинга за этим не видно ошибок
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
 def _today():
