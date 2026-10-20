@@ -1,5 +1,6 @@
 import json
 import re
+import asyncio
 import pytz
 from datetime import datetime
 from groq import Groq
@@ -7,62 +8,66 @@ import config
 
 groq_client = Groq(api_key=config.GROQ_API_KEY)
 
-# llama-3.3-70b-versatile — надёжная модель с хорошим JSON-выводом
 PRIMARY_MODEL = "llama-3.3-70b-versatile"
 FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-SYSTEM_PROMPT = """Ты — ассистент по учету времени. Проанализируй рассказ пользователя и верни ТОЛЬКО валидный JSON без каких-либо пояснений, markdown-блоков или лишнего текста.
+SYSTEM_PROMPT = """Ты — ассистент по учёту времени. Проанализируй текст пользователя и верни ТОЛЬКО валидный JSON.
 
 Текущее время: {now_str}. Сегодня: {today_date}. Часовой пояс: {tz}.
 
 КАТЕГОРИИ (utility):
-- productive: работа, учеба, спорт, чтение, проекты.
-- routine: быт, уборка, еда, гигиена.
-- unproductive: залипание, прокрастинация.
+- productive: работа, учёба, спорт, чтение, проекты
+- routine: быт, уборка, еда, гигиена, готовка
+- unproductive: залипание в телефоне, прокрастинация, бесцельное время
 
-ПРАВИЛА ВРЕМЕНИ:
-- Если названы часы ('с 14:00 до 18:00'), ставь их точно.
-- Если действия шли подряд, продолжай цепочку вплоть до текущего момента ({current_time}).
-- Не ставь накладывающиеся интервалы.
-
-ВЕРНИ ТОЛЬКО ЭТОТ JSON (без ```json, без пояснений):
-{{
+Верни JSON строго в этом формате:
+{
   "activities": [
-    {{
-      "title": "Название активности",
+    {
+      "title": "Название",
       "category": "Категория",
       "utility": "productive",
       "duration_minutes": 60,
-      "start_time": "{today_date}T14:00:00",
-      "end_time": "{today_date}T15:00:00"
-    }}
+      "start_time": "2024-01-01T08:00:00",
+      "end_time": "2024-01-01T09:00:00"
+    }
   ],
   "tasks_to_add": [],
   "habit_identified": null,
-  "encouragement": "Мотивирующая фраза"
-}}"""
+  "encouragement": "Мотивирующая фраза на русском"
+}
+
+Замени дату на {today_date}. Никакого текста кроме JSON."""
+
+
+def _call_groq(model: str, messages: list, use_json_format: bool = False) -> str:
+    """Синхронный вызов Groq API (будет запущен в отдельном потоке)."""
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 800,
+    }
+    if use_json_format:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = groq_client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
 
 
 def _clean_json(raw: str) -> str:
-    """Очищает ответ модели от markdown-блоков и лишнего текста."""
+    """Очищает ответ от markdown и лишнего текста, оставляя только JSON."""
     raw = raw.strip()
     # Убираем ```json ... ``` блоки
     raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
-    # Находим первый { и последний } — берём только JSON
+    # Берём только от первой { до последней }
     start = raw.find("{")
     end = raw.rfind("}")
-    if start != -1 and end != -1:
+    if start != -1 and end != -1 and end > start:
         raw = raw[start:end + 1]
     return raw
-
-
-def _build_messages(prompt: str, text: str) -> list:
-    return [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text}
-    ]
 
 
 async def parse_voice_text(text: str) -> dict:
@@ -79,62 +84,71 @@ async def parse_voice_text(text: str) -> dict:
         tz=config.TIMEZONE
     )
 
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text}
+    ]
+
     raw_text = None
 
-    # Попытка 1 — основная модель без json_object (надёжнее)
+    # Попытка 1 — основная модель с json_object (поддерживается llama-3.3-70b)
     try:
-        response = groq_client.chat.completions.create(
-            model=PRIMARY_MODEL,
-            messages=_build_messages(prompt, text),
-            temperature=0.1,
-            max_tokens=800
-        )
-        raw_text = response.choices[0].message.content
+        raw_text = await asyncio.to_thread(_call_groq, PRIMARY_MODEL, messages, True)
+        print(f"[ai_parser] {PRIMARY_MODEL} ответил: {raw_text[:200]}")
     except Exception as e:
-        print(f"[ai_parser] Основная модель ({PRIMARY_MODEL}) упала: {e}")
+        print(f"[ai_parser] {PRIMARY_MODEL} упал: {e}")
+        raw_text = None
 
-    # Попытка 2 — резервная модель
+    # Попытка 2 — основная модель без json_object
     if raw_text is None:
         try:
-            response = groq_client.chat.completions.create(
-                model=FALLBACK_MODEL,
-                messages=_build_messages(prompt, text),
-                temperature=0.1,
-                max_tokens=600
-            )
-            raw_text = response.choices[0].message.content
+            raw_text = await asyncio.to_thread(_call_groq, PRIMARY_MODEL, messages, False)
+            print(f"[ai_parser] {PRIMARY_MODEL} (без json) ответил: {raw_text[:200]}")
         except Exception as e:
-            print(f"[ai_parser] Резервная модель ({FALLBACK_MODEL}) тоже упала: {e}")
+            print(f"[ai_parser] {PRIMARY_MODEL} (без json) упал: {e}")
+            raw_text = None
 
-    # Если обе модели упали — возвращаем заглушку
+    # Попытка 3 — резервная модель
     if raw_text is None:
+        try:
+            raw_text = await asyncio.to_thread(_call_groq, FALLBACK_MODEL, messages, False)
+            print(f"[ai_parser] {FALLBACK_MODEL} ответил: {raw_text[:200]}")
+        except Exception as e:
+            print(f"[ai_parser] {FALLBACK_MODEL} упал: {e}")
+            raw_text = None
+
+    # Все модели упали
+    if raw_text is None:
+        print("[ai_parser] Все модели упали, возвращаю заглушку.")
         return {
             "activities": [],
             "tasks_to_add": [],
             "habit_identified": None,
-            "encouragement": "Не удалось разобрать сообщение, попробуй ещё раз."
+            "encouragement": "Слышу тебя! Что-то пошло не так с анализом, попробуй ещё раз через минуту."
         }
 
     # Парсим JSON
     cleaned = _clean_json(raw_text)
     try:
         data = json.loads(cleaned)
+        print(f"[ai_parser] JSON успешно распарсен, активностей: {len(data.get('activities', []))}")
     except json.JSONDecodeError as e:
-        print(f"[ai_parser] Не удалось распарсить JSON: {e}\nRaw: {raw_text[:300]}")
+        print(f"[ai_parser] JSONDecodeError: {e}")
+        print(f"[ai_parser] Сырой ответ: {raw_text[:500]}")
         return {
             "activities": [],
             "tasks_to_add": [],
             "habit_identified": None,
-            "encouragement": "Получила твоё сообщение, но не смогла разобрать детали. Попробуй ещё раз!"
+            "encouragement": "Получила твоё сообщение! Попробуй ещё раз — иногда нужна пара попыток 🙂"
         }
 
-    # Гарантируем наличие ключей
+    # Гарантируем нужные ключи
     data.setdefault("activities", [])
     data.setdefault("tasks_to_add", [])
     data.setdefault("habit_identified", None)
     data.setdefault("encouragement", "")
 
-    # Если activities вложены в другой ключ
+    # Если activities вложены внутрь другого ключа
     if not data["activities"]:
         for k, v in data.items():
             if isinstance(v, dict) and "activities" in v:
