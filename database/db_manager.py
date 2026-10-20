@@ -1,4 +1,5 @@
 ﻿import aiosqlite
+import sqlite3
 import os
 from datetime import datetime
 
@@ -98,8 +99,13 @@ async def get_or_create_profile(user_id: int, today_str: str):
             
         return {'start_date': start_date, 'target_days': target_days, 'phase': phase, 'days_passed': days_passed}
 
+def _pattern_title(title: str) -> str:
+    # Только первая буква заглавная: capitalize() портил «ELGE» → «Elge»
+    title = (title or "").strip()
+    return title[:1].upper() + title[1:]
+
 async def record_pattern(user_id: int, title: str, utility: str, date_str: str):
-    title_clean = title.strip().capitalize()
+    title_clean = _pattern_title(title)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT id, count_logs, last_performed, avg_interval_days FROM patterns WHERE user_id = ? AND title = ?', (user_id, title_clean)) as cursor:
             row = await cursor.fetchone()
@@ -229,6 +235,58 @@ async def mark_reminder_sent(reminder_id, today_date):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('UPDATE reminders SET last_sent = ? WHERE id = ?', (today_date, reminder_id))
         await db.commit()
+
+def backup_bytes() -> bytes:
+    """Целостная копия базы (через sqlite backup API, даже если бот как раз пишет)."""
+    tmp_path = DB_PATH + ".backup"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(tmp_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    with open(tmp_path, "rb") as f:
+        data = f.read()
+    os.remove(tmp_path)
+    return data
+
+async def undo_entry(user_id, act_from, act_to, task_from, task_to):
+    """Удаляет дела и задачи одной записи. Возвращает True, если что-то из неё ушло в календарь."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT title FROM activities WHERE user_id = ? AND id BETWEEN ? AND ?',
+            (user_id, act_from, act_to)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        await db.execute('DELETE FROM activities WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, act_from, act_to))
+        await db.execute('DELETE FROM tasks WHERE user_id = ? AND id BETWEEN ? AND ?', (user_id, task_from, task_to))
+
+        # Пересчитываем ритмы по оставшимся записям, иначе отменённое дело останется в анализе
+        # (или, наоборот, пропадёт, хотя в другой записи за тот же день оно есть)
+        affected = {_pattern_title(r[0]) for r in rows}
+        if affected:
+            async with db.execute(
+                'SELECT title, COALESCE(substr(start_time, 1, 10), substr(created_at, 1, 10)) FROM activities WHERE user_id = ?',
+                (user_id,)
+            ) as cursor:
+                remaining = await cursor.fetchall()
+            for t in affected:
+                days = sorted({day for title, day in remaining if _pattern_title(title) == t and day})
+                if days:
+                    await db.execute(
+                        'UPDATE patterns SET count_logs = ?, last_performed = ? WHERE user_id = ? AND title = ?',
+                        (len(days), days[-1], user_id, t))
+                else:
+                    await db.execute('DELETE FROM patterns WHERE user_id = ? AND title = ?', (user_id, t))
+        await db.commit()
+    profile_phase = await _phase(user_id)
+    return bool(rows) and profile_phase == 'coaching'
+
+async def _phase(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT phase FROM user_profile WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
 
 async def get_today_summary(user_id, date_str):
     async with aiosqlite.connect(DB_PATH) as db:

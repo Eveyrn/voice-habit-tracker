@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
-from bot.handlers import router, reminder_keyboard
+from bot.handlers import router, reminder_keyboard, backup_file, BACKUP_CAPTION
 from database.db_manager import (
     init_db, get_or_create_profile, get_today_summary,
     get_due_reminders, mark_reminder_sent,
@@ -67,9 +67,20 @@ async def send_due_reminders(bot: Bot):
         # Отмечаем в любом случае, чтобы при ошибке не слать каждую минуту
         await mark_reminder_sent(reminder_id, today_str)
 
+async def send_backup(bot: Bot):
+    """Раз в неделю присылает файл базы в Telegram — копия на случай, если хостинг потеряет данные."""
+    for user_id in config.ALLOWED_USER_IDS:
+        try:
+            await bot.send_document(chat_id=user_id, document=backup_file(), caption=BACKUP_CAPTION)
+        except Exception as e:
+            logging.error(f"Ошибка отправки бэкапа {user_id}: {e}")
+
 async def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env файле!")
+    if not config.ALLOWED_USER_IDS:
+        # Без списка бот открыт всем, и чужие люди тратят лимит Groq
+        raise ValueError("ALLOWED_USER_IDS не задан в .env — бот не запущен, чтобы не быть открытым для всех")
 
     await init_db()
 
@@ -86,6 +97,7 @@ async def main():
     scheduler.add_job(afternoon_checkin, 'cron', hour=16, minute=0, args=[bot])
     scheduler.add_job(evening_checkin, 'cron', hour=21, minute=30, args=[bot])
     scheduler.add_job(send_due_reminders, 'cron', minute='*', args=[bot])
+    scheduler.add_job(send_backup, 'cron', day_of_week='sun', hour=22, minute=0, args=[bot])
 
     scheduler.start()
     logging.info("Планировщик напоминаний запущен (11:00, 16:00, 21:30).")

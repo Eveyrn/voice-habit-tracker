@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime
 from aiogram import Router, F, types
 from aiogram.filters import CommandStart, Command
+from aiogram.types import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
@@ -36,7 +37,7 @@ async def cmd_start(message: types.Message):
         "В эти 3 недели Календарь отдыхает и не засоряется. Я просто внимательно собираю статистику "
         "твоего естественного ритма дня, циклы быта и отдыха.\n\n"
         "Через 3 недели я автоматически сформирую твоё идеальное расписание и подключу Google / Samsung / Redmi календарь!\n\n"
-        "🎙 Просто присылай голосовые о том, как прошёл день или дело:\n"
+        "🎙 Просто присылай голосовые (или пиши текстом) о том, как прошёл день или дело:\n"
         "- 'С 14:00 до 18:00 работала, потом час смотрела сериал'\n\n"
         "Команды:\n"
         "/patterns — выявленные циклы и ритмы\n"
@@ -44,9 +45,26 @@ async def cmd_start(message: types.Message):
         "/habits — прогресс привычек\n"
         "/remind 10:00 Выпить витамины — ежедневное напоминание\n"
         "/reminders — мои напоминания\n"
-        "/summary — баланс времени за день"
+        "/summary — баланс времени за день\n"
+        "/backup — прислать копию базы (раз в неделю приходит сама)"
     )
     await message.answer(welcome_text)
+
+# ---------- Бэкап ----------
+
+BACKUP_CAPTION = "💾 Копия базы трекера. Сохрани её — если хостинг потеряет данные, из этого файла всё восстановится."
+
+
+def backup_file():
+    today = datetime.now(pytz.timezone(config.TIMEZONE)).strftime("%Y-%m-%d")
+    return BufferedInputFile(db_manager.backup_bytes(), filename=f"tracker_{today}.db")
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if not check_auth(message.from_user.id):
+        return
+    await message.answer_document(backup_file(), caption=BACKUP_CAPTION)
 
 # ---------- Напоминания ----------
 
@@ -256,7 +274,24 @@ async def handle_voice(message: types.Message):
         if not transcript.strip():
             await status_msg.edit_text("Не удалось распознать слова в аудиосообщении.")
             return
+        await process_entry(message, status_msg, transcript)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_text(message: types.Message):
+    """То же, что голосовое, только без расшифровки."""
+    if not check_auth(message.from_user.id):
+        return
+    status_msg = await message.reply("Разбираю...")
+    await process_entry(message, status_msg, message.text.strip())
+
+
+async def process_entry(message: types.Message, status_msg: types.Message, transcript: str):
+    """Разбор текста дня: дела → база (+календарь), задачи, привычки, напоминания."""
+    try:
         tz = pytz.timezone(config.TIMEZONE)
         now_dt = datetime.now(tz)
         today_date = now_dt.strftime("%Y-%m-%d")
@@ -266,7 +301,9 @@ async def handle_voice(message: types.Message):
         await status_msg.edit_text(f"\"{transcript}\"\n\nСоставляю хронологию...")
 
         # 2. AI-анализ
-        analysis = await parse_voice_text(transcript)
+        known_titles = [row[0] for row in await db_manager.get_top_patterns(message.from_user.id)][:60]
+        analysis = await parse_voice_text(transcript, known_titles)
+        activity_ids, task_ids = [], []
 
         response_lines = [f"\"{transcript}\"\n"]
 
@@ -304,7 +341,7 @@ async def handle_voice(message: types.Message):
                     description=f"Категория: {category} | Из голосового трекера"
                 )
 
-            await db_manager.add_activity(
+            activity_id = await db_manager.add_activity(
                 user_id=message.from_user.id,
                 title=title,
                 category=category,
@@ -313,6 +350,7 @@ async def handle_voice(message: types.Message):
                 start_time=start_time,
                 end_time=end_time
             )
+            activity_ids.append(activity_id)
 
             # Записываем паттерн в базу
             await db_manager.record_pattern(
@@ -336,7 +374,7 @@ async def handle_voice(message: types.Message):
         if new_tasks:
             response_lines.append("\nДобавлено в To-Do:")
             for t in new_tasks:
-                await db_manager.add_task(message.from_user.id, t)
+                task_ids.append(await db_manager.add_task(message.from_user.id, t))
                 response_lines.append(f"- {t}")
 
         # 5. Привычки
@@ -361,12 +399,33 @@ async def handle_voice(message: types.Message):
         if encouragement:
             response_lines.append(f"\n{encouragement}")
 
-        await status_msg.edit_text("\n".join(response_lines))
+        markup = None
+        if activity_ids or task_ids:
+            builder = InlineKeyboardBuilder()
+            builder.button(text="↩️ Отменить запись", callback_data=f"undo_{_ids(activity_ids)}_{_ids(task_ids)}")
+            markup = builder.as_markup()
+        await status_msg.edit_text("\n".join(response_lines), reply_markup=markup)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         await status_msg.edit_text(f"Ошибка обработки: {str(e)[:200]}")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+
+def _ids(ids):
+    # id в одной записи идут подряд (бот для одного человека), поэтому храним диапазон
+    # «первый-последний»: callback_data ограничен 64 байтами
+    return f"{min(ids)}-{max(ids)}" if ids else "0-0"
+
+
+@router.callback_query(F.data.startswith("undo_"))
+async def process_undo(callback: types.CallbackQuery):
+    _, acts, tasks = callback.data.split("_")
+    a_from, a_to = map(int, acts.split("-"))
+    t_from, t_to = map(int, tasks.split("-"))
+    had_calendar = await db_manager.undo_entry(callback.from_user.id, a_from, a_to, t_from, t_to)
+    await callback.answer("Запись отменена")
+    note = "\n\n↩️ Отменено — дела и задачи из этой записи удалены."
+    if had_calendar:
+        note += "\nСобытия в Google Календаре удали вручную."
+    await callback.message.edit_text((callback.message.text or "") + note)

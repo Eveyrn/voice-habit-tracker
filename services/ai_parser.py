@@ -32,7 +32,7 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
   "activities": [
     {{
       "title": "Название",
-      "category": "Категория",
+      "category": "Работа",
       "utility": "productive",
       "duration_minutes": 60,
       "start_time": "2024-01-01T08:00:00",
@@ -44,6 +44,16 @@ SYSTEM_PROMPT = """Ты — ассистент по учёту времени. �
   "reminders": [{{"text": "Выпить витамины", "time": "10:00"}}],
   "encouragement": "Мотивирующая фраза на русском"
 }}
+
+ВРЕМЯ. Пользователь рассказывает о том, что УЖЕ было. Если время не названо («час залипала, потом 2 часа работала»),
+выстрой дела подряд так, чтобы ПОСЛЕДНЕЕ закончилось сейчас ({current_time}), и считай назад. Ничего не ставь в будущее.
+
+category — СТРОГО одно из: {categories}.
+
+НАЗВАНИЯ ДЕЛ (title) — коротко, существительным, без подробностей в скобках: «Залипание в телефоне», «Завтрак», «Работа над ботом».
+Уже известные дела пользователя: {known_titles}
+Если дело по смыслу совпадает с известным — используй ТОЧНО то же название (иначе статистика ритмов рассыплется).
+Новое название — только если такого дела в списке правда нет.
 
 tasks_to_add — список СТРОК (только текст задачи), пустой список, если планов нет.
 habit_identified — строка с названием привычки или null.
@@ -89,7 +99,10 @@ def _clean_json(raw: str) -> str:
     return raw
 
 
-async def parse_voice_text(text: str) -> dict:
+CATEGORIES = ["Работа", "Учёба", "Спорт", "Еда", "Быт", "Здоровье", "Сон", "Дорога", "Общение", "Отдых", "Телефон", "Другое"]
+
+
+async def parse_voice_text(text: str, known_titles: list | None = None) -> dict:
     tz = pytz.timezone(config.TIMEZONE)
     now = datetime.now(tz)
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -100,7 +113,9 @@ async def parse_voice_text(text: str) -> dict:
         now_str=now_str,
         today_date=today_date,
         current_time=current_time,
-        tz=config.TIMEZONE
+        tz=config.TIMEZONE,
+        categories=", ".join(CATEGORIES),
+        known_titles=", ".join(f"«{t}»" for t in known_titles) if known_titles else "пока нет",
     )
 
     messages = [
@@ -177,6 +192,12 @@ async def parse_voice_text(text: str) -> dict:
                 break
 
     # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
+    # Категория — только из фиксированного списка, иначе /summary дробится на «залипание в телефоне», «телефон», …
+    lower_map = {c.lower(): c for c in CATEGORIES}
+    for act in data["activities"]:
+        if isinstance(act, dict):
+            act["category"] = lower_map.get(str(act.get("category", "")).strip().lower(), "Другое")
+
     data["tasks_to_add"] = [t for t in (_as_text(x) for x in data.get("tasks_to_add") or []) if t]
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
     data["reminders"] = _clean_reminders(data.get("reminders"))
