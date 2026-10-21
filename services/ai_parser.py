@@ -345,6 +345,21 @@ def _problems(data: dict, text: str) -> list[str]:
     if REGULAR_RE.search(text) and rems and not any(str(r.get("repeat", "")).lower() == "daily" for r in rems):
         problems.append("Что просят делать регулярно («каждый день …») — напоминание с repeat \"daily\" (время не сказано — "
                         "time null); разовые оставь разовыми.")
+    # «С подругой встретимся в 3–4» модель иногда кладёт в задачи без времени — а время названо
+    rem_texts = " ".join(_as_text(r) for r in rems).lower()
+    for task in data.get("tasks_to_add") or []:
+        t_text = _as_text(task)
+        if t_text and any(CLOCK_IN_CLAUSE_RE.search(c) for c in timeline._clauses(text) if timeline._mentions({"title": t_text}, c)) \
+                and not timeline._mentions({"title": t_text}, rem_texts):
+            problems.append(f"«{t_text}» — в сообщении названо время: это напоминание (kind \"event\", time — "
+                            "начало, если сказано «в 3–4» — 15:00), а не задача.")
+    # «Скорее всего встретимся в 3–4 сегодня» модель иногда просто выбрасывает — из-за «скорее всего»
+    items = [_as_text(x) for k in ("activities", "tasks_to_add", "reminders") for x in data.get(k) or []]
+    for clause in timeline._clauses(text):
+        if CLOCK_IN_CLAUSE_RE.search(clause) and PLAN_WORDS_RE.search(clause) \
+                and not any(timeline._mentions({"title": item}, clause) for item in items if item):
+            problems.append(f"В сообщении есть план со временем: «{clause.strip()}» — добавь напоминание (kind \"event\"); "
+                            "даже если время неточное («в 3–4», «скорее всего») — поставь начало, например 15:00.")
     if _size(data) == 0 and len(text) > 40:
         problems.append("Ответ пустой, а в сообщении есть дела, планы или задачи — разбери их.")
     if text.strip().endswith("?") and data.get("intent") == "log" and not data.get("answer"):
@@ -392,7 +407,8 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
     data = _load(raw)
 
     # Проверка и одна попытка исправить: модель от раза к разу ошибается по-разному
-    problems = _problems(data, text) if data is not None else ["Ответ — не JSON. Верни только JSON в нужном формате."]
+    problems = list(dict.fromkeys(_problems(data, text))) if data is not None else \
+        ["Ответ — не JSON. Верни только JSON в нужном формате."]
     if problems:
         print(f"[ai_parser] переспрашиваю: {problems}")
         retry = messages + [{"role": "assistant", "content": raw},
@@ -402,8 +418,12 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
         data2 = _load(raw2) if raw2 else None
         # Исправленный ответ берём, только если он ничего не потерял: 20.10 переспрос вернул пустой JSON
         # («ошибок меньше») — и бот ответил «не нашёл здесь дел» на сообщение из шести дел
-        if data2 is not None and (data is None or (len(_problems(data2, text)) < len(problems)
-                                                   and _size(data2) >= _size(data))):
+        # Чуть меньше элементов — можно (две задачи «встреча» стали одним напоминанием), пусто или сильно меньше — нет
+        if data2 is not None and (data is None or (len(set(_problems(data2, text))) < len(problems)
+                                                   and _size(data2) > 0 and _size(data2) >= _size(data) - len(problems))):
+            # Переспрашиваем про задачи и напоминания — а дела модель при этом иногда теряет: берём их из первого ответа
+            if data is not None and len(data2.get("activities") or []) < len(data.get("activities") or []):
+                data2["activities"] = data["activities"]
             data = data2
 
     if data is None:
@@ -441,7 +461,8 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
         for rem in [r for r in data["reminders"] if r["date"] and not r["time"]]:
             data["reminders"].remove(rem)
             tasks.append({"text": rem["text"], "due": rem["date"]})
-    data["tasks_to_add"] = _dedupe_tasks(tasks)
+    data["tasks_to_add"], data["choices"] = _collapse_choices(_dedupe_tasks(tasks), text, now)
+    _mark_tentative(data["reminders"], text)
     data["edits"] = _clean_edits(data.get("edits"))
     data["intent"] = data["intent"] if data["intent"] in ("log", "question", "correction", "chat") else "log"
     data["answer"] = _as_text(data.get("answer")).replace("**", "")
@@ -486,6 +507,53 @@ def _dedupe_tasks(tasks: list) -> list:
         if key not in result or (t["due"] or "") > (result[key]["due"] or ""):
             result[key] = t
     return list(result.values())
+
+
+CHOICE_RE = re.compile(r"\bлибо\b|\bили\b", re.I)
+UNSURE_RE = re.compile(r"не знаю|точно не|скорее всего|наверн|может быть|\bможет\b|возможно|посмотрю|как получится", re.I)
+PLAN_WORDS_RE = re.compile(r"\b(завтра|сегодня|в (понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)|"
+                           r"встретимся|увидимся|созвонимся|буду|будем|пойду|поеду|надо|нужно)\b", re.I)
+CLOCK_IN_CLAUSE_RE =re.compile(r"\b(в|к|около)\s+\d{1,2}([:.]\d{2})?(\s*[-–]\s*\d{1,2})?\b", re.I)
+TENTATIVE_RE = re.compile(r"скорее всего|наверн|может быть|возможно|вроде бы|\bлибо\b|\bили\b|не знаю|не уверен|"
+                          r"как получится|если получится|пока не ясно|\d{1,2}\s*[-–]\s*\d{1,2}\s*(вечера|утра|дня|ч)", re.I)
+
+
+def _collapse_choices(tasks: list, text: str, now: datetime):
+    """«Буду работать либо над ELGE, либо над работой, точно не знаю» модель делает двумя задачами на сегодня —
+    а это выбор, что делать дальше, не два дела. На сегодня — не задачи, а строка «Дальше: … или …»;
+    на другой день — одна задача «… или …». Возвращает (задачи, выборы)."""
+    choices = []
+    today = now.strftime("%Y-%m-%d")
+    for clause in timeline._clauses(text):
+        if not CHOICE_RE.search(clause):
+            continue
+        group = [t for t in tasks if timeline._mentions({"title": t["text"]}, clause, first_word=True)]
+        # Модель иногда сама склеивает выбор в одну задачу: «Работать над ботом или учёбой»
+        if len(group) < 2 and not (group and CHOICE_RE.search(group[0]["text"])):
+            continue
+        joined = " или ".join([group[0]["text"]] + [t["text"][0].lower() + t["text"][1:] for t in group[1:]])
+        tasks = [t for t in tasks if t not in group]
+        due = max((t["due"] or "") for t in group) or None
+        # «Точно не знаю» на сегодня — это просто «что дальше», а «купить молоко или кефир» — всё же задача
+        if (due or today) <= today and UNSURE_RE.search(clause):
+            choices.append(joined)
+        else:
+            tasks.append({"text": joined, "due": due})
+    return tasks, choices
+
+
+def _mark_tentative(reminders: list, text: str):
+    """«Скорее всего встретимся в 3–4, либо в пятницу» — время не решено: такое напоминание помечаем
+    tentative, бот не ставит его сразу, а позже спрашивает, договорились ли."""
+    if NAG_RE.search(text):
+        return  # «напомни …» — человек сам попросил, ставим как сказано
+    clauses = timeline._clauses(text)
+    for rem in reminders:
+        if not rem.get("date") or not rem.get("time"):
+            continue
+        base = TIME_PREFIX_RE.sub("", rem["text"])
+        if any(TENTATIVE_RE.search(c) for c in clauses if timeline._mentions({"title": base}, c)):
+            rem["tentative"] = True
 
 
 def _clean_time(value):

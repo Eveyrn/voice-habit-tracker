@@ -68,10 +68,15 @@ def _clauses(text: str) -> list[str]:
     return [c for c in re.split(r"[.!?;\n]|,\s*(?=(?:а|но|и|потом|затем|дальше)\s)", text or "", flags=re.I) if c.strip()]
 
 
-def _mentions(act: dict, clause: str) -> bool:
-    """Говорится ли в этой части о деле: «работать над ботом» ↔ «Работа над ботом» (по началам слов)."""
-    low = clause.lower()
-    return any(w[:5] in low for w in re.findall(r"[а-яёa-z]{4,}", (act.get("title") or "").lower()))
+def _mentions(act: dict, clause: str, first_word: bool = False) -> bool:
+    """Говорится ли в этой части о деле: «работать над ботом» ↔ «Работа над ботом» (по началам слов).
+    first_word — совпасть должно первое слово (действие): иначе «Расчесать Симбу» цеплялась к «купить … Симбе»."""
+    low = clause.lower().replace("ё", "е")
+    words = re.findall(r"[а-яa-z]{4,}", (act.get("title") or "").lower().replace("ё", "е"))
+    if first_word:
+        words = words[:1]
+    # Начало слова: 5 букв, у коротких — 4 («Учёба» ↔ «учёбой», «ботом» ↔ «бота»)
+    return any(w[:min(5, max(4, len(w) - 2))] in low for w in words)
 
 
 def split_plans(activities: list, text: str) -> list[str]:

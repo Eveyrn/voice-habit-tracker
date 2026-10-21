@@ -20,7 +20,7 @@ from services.stt import transcribe_audio
 import groq
 from services import timeline
 from services.ai_parser import parse_voice_text, analyze_rhythm, condense_about, clean_category, CATEGORIES, PRIMARY_MODEL, \
-    REGULAR_RE, ABOUT_MAX, QUOTA as ai_quota, LIMIT_HIT as ai_limit
+    REGULAR_RE, ABOUT_MAX, WEEKDAYS_SHORT, QUOTA as ai_quota, LIMIT_HIT as ai_limit
 from services.calendar_api import add_event, build_event
 
 router = Router()
@@ -1317,6 +1317,9 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         # «Дальше буду работать над ботом» — план, а не сделанное (код убрал его из дел)
         plan_lines = [f"⏭ «{title}» ещё впереди — не записываю как сделанное. Напомнить? Скажи, например: "
                       "«напомни в 18:00 …»" for title in analysis.get("planned") or []]
+        # «Буду работать либо над ELGE, либо над работой» — выбор, а не две задачи
+        plan_lines += [f"⏭ Дальше: {choice[0].lower() + choice[1:]} — потом расскажешь, что было."
+                       for choice in analysis.get("choices") or []]
         lines.extend(plan_lines)
 
         activities = analysis["activities"]
@@ -1439,8 +1442,18 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             streak = await db_manager.update_habit(user_id, habit, today_date)
             lines.append(f"\n✅ {habit} — отмечено (серия: {streak} дн.)")
 
-        # 6. Напоминания
+        # 6. Напоминания. Неточные («скорее всего в 3–4, либо в пятницу») не ставим, а позже спрашиваем
+        tentative = [r for r in analysis["reminders"] if r.get("tentative")]
+        if tentative:
+            title, ask_at = await save_tentative(user_id, tentative, transcript, now.replace(tzinfo=None))
+            created["p"] = [title[0]]
+            created["summary"].append(f"неточный план: {title[1]} ({', '.join(_option_label(o) for o in tentative)})")
+            labels = " / ".join(_option_label(o) for o in tentative)
+            lines.append(f"\n🤔 Пока не точно: {title[1]} ({labels}). В {ask_at.strftime('%H:%M')} спрошу, "
+                         "договорились ли, — тогда поставлю напоминание.")
         for rem in analysis["reminders"]:
+            if rem.get("tentative"):
+                continue
             text, time_str, date = rem["text"], rem["time"], rem["date"]
             if not time_str:
                 if MEAL_RE.search(text):
@@ -1481,7 +1494,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
                     lines.append(f"\n🍽 Не забудь: {r_text}")
                     builder.button(text=f"✅ {_short(r_text)}", callback_data=f"remdone_{r_id}")
 
-        if created["a"] or created["t"] or created["r"]:
+        if created["a"] or created["t"] or created["r"] or created.get("p"):
             entry_id = await db_manager.add_entry(user_id, transcript, created, now.replace(tzinfo=None).isoformat())
             if created["a"]:
                 builder.button(text="✏️ Поправить время", callback_data=f"ed_{entry_id}")
@@ -1500,6 +1513,80 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         import traceback
         traceback.print_exc()
         await status_msg.edit_text(f"Ошибка обработки: {str(e)[:200]}")
+
+
+# ---------- Неточные планы ----------
+
+ASK_DEFAULT_MIN = 60  # «скорее всего в 3–4» без «напишет через …» — спрашиваем через час
+ASK_RE = re.compile(r"через\s+(полчаса|пару часов|час|(\d+)\s*(мин|час))", re.I)
+EVENT_TIME_RE = re.compile(r"^В (\d{2}:\d{2})\s+")
+
+
+def _ask_delay(text: str) -> int:
+    """«Она сказала, что через час напишет» — спросить через час."""
+    m = ASK_RE.search(text or "")
+    if not m:
+        return ASK_DEFAULT_MIN
+    word = m.group(1).lower()
+    if word in ("полчаса", "пару часов", "час"):
+        return {"полчаса": 30, "пару часов": 120, "час": 60}[word]
+    return int(m.group(2)) * (1 if m.group(3).lower().startswith("мин") else 60)
+
+
+def _option_label(option: dict) -> str:
+    """«сегодня 15:00» / «пт 23.10 15:00» — время самого события, а не напоминания за 30 минут."""
+    m = EVENT_TIME_RE.match(option["text"])
+    d, today = datetime.strptime(option["date"], "%Y-%m-%d").date(), _now_local().date()
+    day = "сегодня" if d == today else ("завтра" if d == today + timedelta(days=1)
+                                        else f"{WEEKDAYS_SHORT[d.weekday()]} {d.strftime('%d.%m')}")
+    return f"{day} {m.group(1) if m else option['time']}"
+
+
+async def save_tentative(user_id: int, options: list, source_text: str, now: datetime):
+    """Запоминает неточный план; возвращает ((id, название), когда спросить)."""
+    title = EVENT_TIME_RE.sub("", options[0]["text"])
+    title = title[0].upper() + title[1:]
+    first = min(datetime.strptime(f"{o['date']} {o['time']}", "%Y-%m-%d %H:%M") for o in options)
+    # Спросить — когда обещали написать, но не позже, чем за 5 минут до самого раннего варианта
+    ask_at = max(now + timedelta(minutes=1),
+                 min(now + timedelta(minutes=_ask_delay(source_text)), first - timedelta(minutes=5)))
+    opts = [{"text": o["text"], "time": o["time"], "date": o["date"]} for o in options]
+    t_id = await db_manager.add_tentative(user_id, title, opts, ask_at.isoformat(timespec="minutes"))
+    return (t_id, title), ask_at
+
+
+def tentative_question(t_id: int, title: str, options: list):
+    builder = InlineKeyboardBuilder()
+    for i, option in enumerate(options):
+        builder.button(text=f"✅ {_option_label(option).capitalize()}", callback_data=f"tn_{t_id}_{i}")
+    builder.button(text="🕐 Другое время", callback_data=f"tn_{t_id}_o")
+    builder.button(text="✖ Не будет", callback_data=f"tn_{t_id}_x")
+    builder.adjust(1)
+    return f"🤔 {title} — договорились? Когда?", builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("tn_"))
+async def process_tentative(callback: types.CallbackQuery):
+    _, t_id, choice = callback.data.split("_")
+    user_id = callback.from_user.id
+    row = await db_manager.get_tentative(int(t_id), user_id)
+    await callback.answer()
+    if not row:
+        await callback.message.edit_text("Этот план уже отменён.")
+        return
+    _, title, options = row
+    await db_manager.delete_tentative(user_id, [row[0]])
+    if choice == "x":
+        await callback.message.edit_text(f"Ок, {title[0].lower() + title[1:]} — не ставлю.")
+    elif choice == "o":
+        await callback.message.edit_text(f"Напиши или скажи, когда договорились, — например: "
+                                         f"«{title[0].lower() + title[1:]} в пятницу в 15».")
+    else:
+        option = options[int(choice)]
+        reminder_id = await save_reminder(user_id, option["text"], option["time"], option["date"])
+        await callback.message.edit_text(
+            f"⏰ Напомню {format_when(option['time'], option['date'])}: {option['text']}" if reminder_id else
+            f"✅ {option['text']} — напоминать уже поздно, время почти пришло.")
 
 
 # ---------- Пробелы в дне ----------
@@ -1759,6 +1846,7 @@ async def process_undo(callback: types.CallbackQuery):
         return
     data = entry[2]
     event_ids = await db_manager.delete_items(callback.from_user.id, data.get("a", []), data.get("t", []), data.get("r", []))
+    await db_manager.delete_tentative(callback.from_user.id, data.get("p", []))
     await drop_events(callback.from_user.id, event_ids)
     await callback.answer("Запись отменена")
     note = "\n\n↩️ Отменено — дела, задачи и напоминания из этой записи удалены."

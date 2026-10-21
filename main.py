@@ -12,12 +12,12 @@ import config
 from bot.handlers import (
     router, BOT_COMMANDS, ADMIN_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION,
     day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about, oauth_callback,
-    ask_gaps, tasks_for_morning, tidy_history,
+    ask_gaps, tasks_for_morning, tidy_history, tentative_question,
 )
 from services import google_oauth, web_pages
 from database.db_manager import (
     init_db, get_or_create_profile, cleanup_old_reminders,
-    get_due_reminders, mark_reminder_sent, pop_snoozed_reminders,
+    get_due_reminders, mark_reminder_sent, pop_snoozed_reminders, pop_due_tentative,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -78,6 +78,11 @@ async def send_due_reminders(bot: Bot):
 
     for reminder_id, user_id, text in await pop_snoozed_reminders(now.strftime("%Y-%m-%dT%H:%M")):
         await send_to(bot, user_id, f"⏰ {text}", reply_markup=reminder_keyboard(reminder_id))
+
+    # Неточные планы («скорее всего в 3–4, либо в пятницу») — спросить, договорились ли
+    for t_id, user_id, title, options in await pop_due_tentative(now.strftime("%Y-%m-%dT%H:%M")):
+        text, markup = tentative_question(t_id, title, options)
+        await send_to(bot, user_id, text, reply_markup=markup)
 
     for reminder_id, user_id, text in await get_due_reminders(now.strftime("%H:%M"), today_str):
         await send_to(bot, user_id, f"⏰ {text}", reply_markup=reminder_keyboard(reminder_id))

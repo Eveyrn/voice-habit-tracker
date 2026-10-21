@@ -142,6 +142,18 @@ async def init_db():
                 created_at TEXT
             )
         ''')
+        # Неточные планы («скорее всего в 3–4, либо в пятницу»): в ask_at бот спрашивает, договорились ли.
+        # options — JSON [{text, time, date}] — готовые напоминания на выбор
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS tentative (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT,
+                options TEXT,
+                ask_at TEXT,
+                asked INTEGER DEFAULT 0
+            )
+        ''')
         # Настройки и «уже предупреждала сегодня»
         await db.execute('''
             CREATE TABLE IF NOT EXISTS settings (
@@ -369,6 +381,36 @@ async def pop_snoozed_reminders(now_iso):
             await db.execute('UPDATE reminders SET snooze_until = NULL WHERE snooze_until IS NOT NULL AND snooze_until <= ?', (now_iso,))
             await db.commit()
     return rows
+
+async def add_tentative(user_id, title, options: list, ask_at_iso):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute('INSERT INTO tentative (user_id, title, options, ask_at) VALUES (?, ?, ?, ?)',
+                                  (user_id, title, json.dumps(options, ensure_ascii=False), ask_at_iso))
+        await db.commit()
+        return cursor.lastrowid
+
+async def pop_due_tentative(now_iso):
+    """Неточные планы, о которых пора спросить. Сразу отмечает «спрошено», чтобы не спросить дважды."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, user_id, title, options FROM tentative WHERE asked = 0 AND ask_at <= ?',
+                              (now_iso,)) as cursor:
+            rows = await cursor.fetchall()
+        if rows:
+            await db.execute('UPDATE tentative SET asked = 1 WHERE asked = 0 AND ask_at <= ?', (now_iso,))
+            await db.commit()
+    return [(t_id, uid, title, json.loads(options)) for t_id, uid, title, options in rows]
+
+async def get_tentative(tentative_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, title, options FROM tentative WHERE id = ? AND user_id = ?',
+                              (tentative_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+    return (row[0], row[1], json.loads(row[2])) if row else None
+
+async def delete_tentative(user_id, tentative_ids):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany('DELETE FROM tentative WHERE id = ? AND user_id = ?', [(t, user_id) for t in tentative_ids])
+        await db.commit()
 
 async def get_setting(user_id, key, default=None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -654,7 +696,8 @@ async def active_user_ids():
 async def delete_user_data(user_id):
     """Стирает все записи человека (сам доступ остаётся)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        for table in ("activities", "tasks", "habits", "patterns", "reminders", "entries", "settings", "user_profile", "google_calendars"):
+        for table in ("activities", "tasks", "habits", "patterns", "reminders", "entries", "settings", "user_profile", "google_calendars",
+                      "tentative"):
             await db.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
         await db.commit()
 
