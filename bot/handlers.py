@@ -1,5 +1,6 @@
 ﻿import os
 import re
+import html
 import json
 import time
 import secrets
@@ -782,14 +783,23 @@ async def process_reminder_done(callback: types.CallbackQuery):
         return
 
     _, r_text, _, r_date = reminder
-    await callback.answer("Отмечено!")
     if r_date:
         # Разовое — дело сделано, напоминание больше не нужно
         await db_manager.delete_reminder(reminder_id, callback.from_user.id)
-        await callback.message.edit_text(f"✅ {r_text} — готово")
+        done = f"✅ {r_text} — готово"
+    else:
+        streak = await db_manager.update_habit(callback.from_user.id, r_text, _now_local().strftime("%Y-%m-%d"))
+        done = f"✅ {r_text} — готово\n🔥 Серия: {streak} дн. подряд"
+    # Кнопка под ответом на запись («🍽 Не забудь: …») — убираем только её, сам ответ и «Отменить» оставляем
+    others = [[b for b in row if b.callback_data != callback.data] for row in (callback.message.reply_markup.inline_keyboard
+                                                                               if callback.message.reply_markup else [])]
+    others = [row for row in others if row]
+    if any(b.callback_data.startswith(("undo2_", "ed_", "fb")) for row in others for b in row):
+        await callback.answer(done.replace("\n", " · "))
+        await callback.message.edit_reply_markup(reply_markup=types.InlineKeyboardMarkup(inline_keyboard=others))
         return
-    streak = await db_manager.update_habit(callback.from_user.id, r_text, _now_local().strftime("%Y-%m-%d"))
-    await callback.message.edit_text(f"✅ {r_text} — готово\n🔥 Серия: {streak} дн. подряд")
+    await callback.answer("Отмечено!")
+    await callback.message.edit_text(done)
 
 
 # ---------- Списки ----------
@@ -1024,7 +1034,7 @@ async def handle_voice(message: types.Message):
         if await onboarding_about(message, transcript) or await pending_about(message, transcript):
             await status_msg.edit_text(f"«{transcript}»")
             return
-        await process_entry(message, status_msg, transcript)
+        await process_entry(message, status_msg, transcript, voice=True)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -1268,6 +1278,26 @@ def _short(text: str, limit: int = 40) -> str:
     return (cut if len(cut) > limit // 2 else text[:limit]) + "…"
 
 
+async def _reply(status_msg: types.Message, transcript: str, voice: bool, lines: list, markup):
+    """Ответ на запись. Расшифровка голосового — свёрнутой цитатой (раскрывается по нажатию): проверить, как бот
+    расслышал, можно, но она не занимает пол-экрана."""
+    body = html.escape(_join(lines))
+    head = f"<blockquote expandable>{html.escape(transcript)}</blockquote>\n" if voice else ""
+    await status_msg.edit_text(head + body, reply_markup=markup, parse_mode="HTML")
+
+
+HINT_SHOWS = 3
+
+
+async def _hint_once(user_id: int, key: str) -> bool:
+    """Подсказку показываем первые HINT_SHOWS раз, потом молчим."""
+    shown = int(await db_manager.get_setting(user_id, f"hint_{key}", "0") or 0)
+    if shown >= HINT_SHOWS:
+        return False
+    await db_manager.set_setting(user_id, f"hint_{key}", shown + 1)
+    return True
+
+
 def _join(lines):
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -1275,8 +1305,9 @@ def _join(lines):
 UTILITY_LABEL = {"productive": "🟢 полезное", "routine": "⚪ быт", "unproductive": "🔴 прокрастинация"}
 
 
-async def process_entry(message: types.Message, status_msg: types.Message, transcript: str):
-    """Сообщение пользователя: рассказ о дне, вопрос, поправка или просто реплика."""
+async def process_entry(message: types.Message, status_msg: types.Message, transcript: str, voice: bool = False):
+    """Сообщение пользователя: рассказ о дне, вопрос, поправка или просто реплика.
+    voice — голосовое: его расшифровку показываем свёрнутой цитатой (текстовое сообщение и так видно выше)."""
     user_id = message.from_user.id
     try:
         now = _now_local()
@@ -1308,25 +1339,24 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             await status_msg.edit_text(f"«{transcript}»\n\n{analysis['answer']}")
             return
 
-        lines = [f"«{transcript}»\n"]
+        lines = []
         created = {"a": [], "t": [], "r": [], "summary": []}
 
         # 1. Поправки (могут прийти и вместе с рассказом)
         edit_lines = await apply_edits(user_id, analysis["edits"], now)
         lines.extend(edit_lines)
         # «Дальше буду работать над ботом» — план, а не сделанное (код убрал его из дел)
-        plan_lines = [f"⏭ «{title}» ещё впереди — не записываю как сделанное. Напомнить? Скажи, например: "
-                      "«напомни в 18:00 …»" for title in analysis.get("planned") or []]
+        plan_lines = [f"⏭ «{title}» — ещё впереди, не записываю как сделанное" for title in analysis.get("planned") or []]
         # «Буду работать либо над ELGE, либо над работой» — выбор, а не две задачи
         plan_lines += [f"⏭ Дальше: {choice[0].lower() + choice[1:]} — потом расскажешь, что было."
                        for choice in analysis.get("choices") or []]
-        lines.extend(plan_lines)
 
         activities = analysis["activities"]
         has_new = bool(activities or analysis["tasks_to_add"] or analysis["reminders"] or analysis["habit_identified"])
 
         # 2. Вопрос / реплика / только поправка — просто ответ
         if not has_new:
+            lines.extend(plan_lines)
             # После поправки строки «✏️ …» уже всё говорят — ответ модели был бы повтором
             if analysis["answer"] and not (edit_lines and analysis["intent"] == "correction"):
                 lines.append(("\n" if edit_lines else "") + analysis["answer"])
@@ -1335,7 +1365,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             elif not edit_lines and not plan_lines:
                 lines.append("Не нашёл здесь дел, задач или напоминаний. Расскажи, что было, "
                              "или спроси, например: «что у меня сегодня?»")
-            await status_msg.edit_text(_join(lines), reply_markup=_feedback_only())
+            await _reply(status_msg, transcript, voice, lines, _feedback_only())
             return
 
         # 3. Дела. Календарь: свой Google человека (/calendar) — сразу; у владельца без /calendar —
@@ -1354,8 +1384,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
 
             # Будущее — это план, а не сделанное дело
             if start_dt and start_dt > naive_now + timedelta(minutes=5):
-                lines.append(f"⏭ «{title}» ещё впереди — не записываю как сделанное. "
-                             "Напомнить? Скажи, например: «напомни в 18:00 …»")
+                lines.append(f"⏭ «{title}» — ещё впереди, не записываю как сделанное")
                 continue
 
             # Длительность — по времени, если оно есть: модель иногда пишет одно, а время ставит другое
@@ -1404,14 +1433,17 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             created["a"].append(activity_id)
             created["summary"].append(f"дело #{activity_id}: {time_label}{title}")
 
-        if any_approx:
-            lines.append("≈ — время прикинул сам. Если не так, поправь, например: «это было с 9 до 10»")
+        # Подсказку про «≈» — только первые разы: дальше значок и так понятен, а ответ короче
+        if any_approx and await _hint_once(user_id, "approx"):
+            lines.append("≈ — время прикинул сам. Не так — напиши, например: «это было с 9 до 10»")
+        # Про календарь — только если что-то не так («добавлено» каждый раз только удлиняло ответ)
         if activities:
             if calendar_lost:
                 lines.append("⚠️ Доступ к Google Календарю отозван — подключи заново: /calendar")
-            elif google or legacy_calendar:
-                lines.append("📅 Добавлено в Google Календарь" if calendar_ok else
-                             "📥 Сохранено в боте (Google Календарь сейчас не ответил)")
+            elif (google or legacy_calendar) and not calendar_ok:
+                lines.append("📥 Сохранено в боте (Google Календарь сейчас не ответил)")
+
+        lines.extend(plan_lines)
 
         # 4. Задачи
         if analysis["tasks_to_add"]:
@@ -1440,7 +1472,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
                 await db_manager.mark_reminder_sent(match[0], today_date)  # сегодня уже сделано — не напоминать
         if habit:
             streak = await db_manager.update_habit(user_id, habit, today_date)
-            lines.append(f"\n✅ {habit} — отмечено (серия: {streak} дн.)")
+            lines.append(f"✅ {habit} — отмечено (серия: {streak} дн.)")
 
         # 6. Напоминания. Неточные («скорее всего в 3–4, либо в пятницу») не ставим, а позже спрашиваем
         tentative = [r for r in analysis["reminders"] if r.get("tentative")]
@@ -1449,8 +1481,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             created["p"] = [title[0]]
             created["summary"].append(f"неточный план: {title[1]} ({', '.join(_option_label(o) for o in tentative)})")
             labels = " / ".join(_option_label(o) for o in tentative)
-            lines.append(f"\n🤔 Пока не точно: {title[1]} ({labels}). В {ask_at.strftime('%H:%M')} спрошу, "
-                         "договорились ли, — тогда поставлю напоминание.")
+            lines.append(f"🤔 {title[1]} — пока не точно ({labels}). В {ask_at.strftime('%H:%M')} спрошу, договорились ли.")
         for rem in analysis["reminders"]:
             if rem.get("tentative"):
                 continue
@@ -1467,7 +1498,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
                 lines.append(f"\n⏰ «{text}» — {time_str} уже прошло, не ставлю.")
                 continue
             when = format_when(time_str, date)
-            lines.append(f"\n🍽 Буду напоминать после еды: {text}" if time_str == MEAL else f"\n⏰ Напомню {when}: {text}")
+            lines.append(f"🍽 Буду напоминать после еды: {text}" if time_str == MEAL else f"⏰ Напомню {when}: {text}")
             created["r"].append(reminder_id)
             created["summary"].append(f"напоминание #{reminder_id}: {when} — {text}")
 
@@ -1475,9 +1506,6 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         # показываем его, только если в сообщении был ещё и вопрос
         if analysis["answer"] and (analysis["intent"] != "log" or "?" in transcript):
             lines.append(f"\n{analysis['answer']}")
-        if analysis["encouragement"]:
-            lines.append(f"\n{analysis['encouragement']}")
-
         # Мягкий стоп-сигнал: один раз в день, когда телефон/игры перевалили за порог
         # (только если залипание добавлено за СЕГОДНЯ — на запись про вчерашний сериал не реагируем)
         if any(a.get("utility") == "unproductive" and str(a.get("start_time", "")).startswith(today_date) for a in activities):
@@ -1491,17 +1519,21 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         if any(a.get("category") == "Еда" for a in activities):
             for r_id, r_text, r_time, _ in await db_manager.get_reminders(user_id):
                 if r_time == MEAL:
-                    lines.append(f"\n🍽 Не забудь: {r_text}")
+                    lines.append(f"🍽 Не забудь: {r_text}")
                     builder.button(text=f"✅ {_short(r_text)}", callback_data=f"remdone_{r_id}")
+        if analysis["encouragement"]:
+            lines.append(f"\n{analysis['encouragement']}")
 
         if created["a"] or created["t"] or created["r"] or created.get("p"):
             entry_id = await db_manager.add_entry(user_id, transcript, created, now.replace(tzinfo=None).isoformat())
             if created["a"]:
-                builder.button(text="✏️ Поправить время", callback_data=f"ed_{entry_id}")
-            builder.button(text="↩️ Отменить запись", callback_data=f"undo2_{entry_id}")
-        builder.button(text=FEEDBACK_LABEL, callback_data="fb")
-        builder.adjust(1)
-        await status_msg.edit_text(_join(lines), reply_markup=builder.as_markup())
+                builder.button(text="✏️ Время", callback_data=f"ed_{entry_id}")
+            builder.button(text="↩️ Отменить", callback_data=f"undo2_{entry_id}")
+        builder.button(text="👎 Ошибка", callback_data="fb")
+        # «Не забудь …» — каждая своей строкой, служебные — одной строкой внизу
+        service = 1 + bool(created["a"] or created["t"] or created["r"] or created.get("p")) + bool(created["a"])
+        builder.adjust(*([1] * (len(list(builder.buttons)) - service)), service)
+        await _reply(status_msg, transcript, voice, lines, builder.as_markup())
 
         # Знакомство: первая настоящая запись — шаг 3
         if (created["a"] or created["t"] or created["r"]) and \
@@ -1853,7 +1885,7 @@ async def process_undo(callback: types.CallbackQuery):
     if any(e is None for e in event_ids) and callback.from_user.id == config.OWNER_ID \
             and await db_manager._phase(callback.from_user.id) == "coaching" and not await db_manager.get_google(callback.from_user.id):
         note += "\nСобытия в Google Календаре удали вручную."
-    await callback.message.edit_text((callback.message.text or "") + note)
+    await callback.message.edit_text((callback.message.html_text or "") + html.escape(note), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("undo_"))
@@ -1867,4 +1899,4 @@ async def process_undo_legacy(callback: types.CallbackQuery):
     note = "\n\n↩️ Отменено — дела и задачи из этой записи удалены."
     if had_calendar:
         note += "\nСобытия в Google Календаре удали вручную."
-    await callback.message.edit_text((callback.message.text or "") + note)
+    await callback.message.edit_text((callback.message.html_text or "") + html.escape(note), parse_mode="HTML")
