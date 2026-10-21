@@ -21,7 +21,7 @@ from services.stt import transcribe_audio
 import groq
 from services import timeline
 from services.ai_parser import parse_voice_text, analyze_rhythm, condense_about, clean_category, CATEGORIES, PRIMARY_MODEL, \
-    REGULAR_RE, ABOUT_MAX, WEEKDAYS_SHORT, QUOTA as ai_quota, LIMIT_HIT as ai_limit
+    REGULAR_RE, ABOUT_MAX, WEEKDAYS_SHORT, logical_tomorrow, QUOTA as ai_quota, LIMIT_HIT as ai_limit
 from services.calendar_api import add_event, build_event
 
 router = Router()
@@ -693,7 +693,8 @@ async def cmd_remind(message: types.Message):
     date = None
     first, _, tail = rest.partition(" ")
     if first.lower() in ("сегодня", "завтра"):
-        date = (_now_local() + timedelta(days=0 if first.lower() == "сегодня" else 1)).strftime("%Y-%m-%d")
+        # Ночью «завтра» — это уже наступивший календарный день (человек ещё не спал)
+        date = (_now_local().date() if first.lower() == "сегодня" else logical_tomorrow(_now_local())).strftime("%Y-%m-%d")
         rest = tail.strip()
         first, _, tail = rest.partition(" ")
 

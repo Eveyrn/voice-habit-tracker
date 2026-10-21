@@ -22,7 +22,8 @@ STATIC_PROMPT_TEMPLATE = """Ты разбираешь сообщения в Tele
 
 intent:
 - "log" — что делал(а), планы, задачи, просьбы напомнить;
-- "question" — вопрос о своих делах и планах («что у меня сегодня?»): ответ в answer строго по ДАННЫМ, без выдумок;
+- "question" — вопрос о своих делах и планах («что у меня сегодня?»): ответ в answer строго по ДАННЫМ, без выдумок
+  и без номеров #;
   если ответа в данных нет — так и скажи; ничего не создавай. Про период шире имеющихся дней — считай по тем, что есть,
   и назови их («записи есть только за сегодня и вчера: …»);
 - "correction" — поправка к уже записанному («не каждый день, только сегодня», «нет, до 11», «удали это») → edits,
@@ -81,7 +82,7 @@ EDITS_PROMPT = """ПОПРАВКИ (edits) — только к элемента�
 {"op": "activity_update", "id": N, "title": "…", "start": "ЧЧ:ММ", "end": "ЧЧ:ММ", "utility": "…", "category": "…"}
 (только изменённые поля) | {"op": "activity_delete", "id": N} | {"op": "task_delete", "id": N}"""
 
-DYNAMIC_PROMPT = """Сейчас: {now_str}, {weekday} (сегодня {today}, завтра {tomorrow}), часовой пояс {tz}.
+DYNAMIC_PROMPT = """Сейчас: {now_str}, {weekday} (сегодня {today}, завтра {tomorrow}), часовой пояс {tz}.{night}
 Даты дней недели (бери отсюда, не считай): {week}.
 О пользователе: {about}
 Известные дела пользователя: {known_titles}
@@ -383,7 +384,9 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
         now_str=now.strftime("%Y-%m-%d %H:%M"),
         weekday=WEEKDAYS[now.weekday()],
         today=today_date,
-        tomorrow=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
+        tomorrow=logical_tomorrow(now).strftime("%Y-%m-%d"),
+        night=(f"\nСейчас ночь, человек ещё не спал: его «завтра» — это {today_date} (день после сна)."
+               if now.hour < NIGHT_END_HOUR else ""),
         # Модель путает, какое число будет в пятницу, — даём готовый календарь на неделю вперёд
         week=", ".join(f"{WEEKDAYS_SHORT[d.weekday()]} {d.strftime('%Y-%m-%d')}"
                        for d in (now + timedelta(days=i) for i in range(1, 8))),
@@ -432,6 +435,9 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
     return _normalize(data, text, now)
 
 
+SERVICE_ID_RE = re.compile(r"(?<![\d:.])(?:#\d+:?\s*|\b\d{2,6}\s*—\s*(?=[А-ЯЁA-Z«]))")
+
+
 def _normalize(data: dict, text: str, now: datetime) -> dict:
     today_date = now.strftime("%Y-%m-%d")
     for key, default in EMPTY_RESULT.items():
@@ -465,7 +471,8 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
     _mark_tentative(data["reminders"], text)
     data["edits"] = _clean_edits(data.get("edits"))
     data["intent"] = data["intent"] if data["intent"] in ("log", "question", "correction", "chat") else "log"
-    data["answer"] = _as_text(data.get("answer")).replace("**", "")
+    # Номера из ДАННЫХ — служебные: «Сегодня открыты задачи: 24 — Работать» (21.10) человеку ни к чему
+    data["answer"] = SERVICE_ID_RE.sub("", _as_text(data.get("answer")).replace("**", ""))
     data["encouragement"] = _as_text(data.get("encouragement")) if data["intent"] == "log" else ""
     return data
 
@@ -475,13 +482,22 @@ NAG_RE = re.compile(r"напомн|напоминай", re.I)
 ROUTINE_TASK_RE = re.compile(r"^(по)?(завтракать|обедать|ужинать|есть|кушать|перекусить)$|^(пораньше\s+)?встать(\s+пораньше)?$", re.I)
 
 
+NIGHT_END_HOUR = 5  # до 5 утра человек обычно ещё не спал: его «завтра» — это уже наступивший календарный день
+
+
+def logical_tomorrow(now: datetime):
+    """«Завтра убраться», сказанное в 01:01, — это сегодняшнее число (после сна), а не послезавтра.
+    21.10 бот поставил такие задачи на 22.10."""
+    return now.date() if now.hour < NIGHT_END_HOUR else now.date() + timedelta(days=1)
+
+
 def _resolve_date(value, now: datetime):
     """today / tomorrow / thu / ГГГГ-ММ-ДД → ГГГГ-ММ-ДД (дни недели — ближайший такой день, сегодня включительно)."""
     v = str(value or "").strip().lower()
     if v == "today":
         return now.strftime("%Y-%m-%d")
     if v == "tomorrow":
-        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        return logical_tomorrow(now).strftime("%Y-%m-%d")
     weekday = timeline.weekday_date(v, now.date())
     return weekday.strftime("%Y-%m-%d") if weekday else _clean_date(v)
 
