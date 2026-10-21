@@ -82,6 +82,7 @@ EDITS_PROMPT = """ПОПРАВКИ (edits) — только к элемента�
 (только изменённые поля) | {"op": "activity_delete", "id": N} | {"op": "task_delete", "id": N}"""
 
 DYNAMIC_PROMPT = """Сейчас: {now_str}, {weekday} (сегодня {today}, завтра {tomorrow}), часовой пояс {tz}.
+Даты дней недели (бери отсюда, не считай): {week}.
 О пользователе: {about}
 Известные дела пользователя: {known_titles}
 ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:
@@ -191,6 +192,31 @@ FIRST_DAYS_PROMPT = """Ты — спокойный коуч по распоря�
 Расписание НЕ составляй."""
 
 
+ABOUT_PROMPT = """Сожми рассказ человека о себе в заметку для трекера дня: 1–2 предложения, до 300 символов, в третьем
+лице и в его роде («Разработчица и художница…»). Оставь: чем занимается, что для него полезно (работа, учёба, цели),
+увлечения. Только текст заметки, без кавычек.
+
+Рассказ: {text}"""
+ABOUT_MAX = 300
+
+
+async def condense_about(text: str) -> str:
+    """«О себе» уходит в каждый запрос к модели — длинный рассказ сжимаем (один раз, при сохранении)."""
+    text = text.strip()
+    if len(text) <= ABOUT_MAX:
+        return text
+    messages = [{"role": "user", "content": ABOUT_PROMPT.format(text=text[:3000])}]
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            short = (await asyncio.to_thread(_call_groq, model, messages, False)).replace("**", "").strip().strip("«»\"")
+            if short:
+                return short[:ABOUT_MAX + 100]
+        except Exception as e:
+            print(f"[condense_about] {model} упала: {e}")
+    cut = text[:ABOUT_MAX]
+    return cut[:cut.rfind(".") + 1] if "." in cut else cut
+
+
 def _fmt_hour(hours: list) -> str:
     """Среднее время по кругу суток: 23:00 и 01:00 → 00:00, а не 12:00, как дало бы обычное среднее."""
     angles = [h / 24 * 2 * math.pi for h in hours]
@@ -233,11 +259,22 @@ async def analyze_rhythm(stats: dict, days: int, about: str = "", period: int = 
 
 
 CATEGORIES = ["Работа", "Учёба", "Спорт", "Еда", "Быт", "Здоровье", "Сон", "Дорога", "Общение", "Отдых", "Телефон", "Другое"]
+# Что модель писала в category до фиксированного списка (в старых записях это осталось)
+CATEGORY_ALIASES = {"развлечение": "Отдых", "развлечения": "Отдых", "игры": "Отдых", "досуг": "Отдых",
+                    "залипание в телефоне": "Телефон", "соцсети": "Телефон", "учеба": "Учёба", "покупки": "Быт",
+                    "семья": "Общение", "друзья": "Общение", "гигиена": "Быт", "уборка": "Быт", "питание": "Еда"}
+
+
+def clean_category(value) -> str:
+    """Категория — только из фиксированного списка, иначе /summary дробится на «залипание в телефоне», «телефон», …"""
+    low = str(value or "").strip().lower()
+    return {c.lower(): c for c in CATEGORIES}.get(low) or CATEGORY_ALIASES.get(low) or "Другое"
 
 
 STATIC_PROMPT = STATIC_PROMPT_TEMPLATE.format(categories=", ".join(CATEGORIES), canonical=timeline.CANONICAL_HINT)
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 EMPTY_RESULT = {
     "intent": "log", "answer": "", "activities": [], "tasks_to_add": [],
@@ -285,6 +322,13 @@ def _load(raw: str):
 AGO_RE = re.compile(r"\bназад\b|только что", re.I)
 RANGE_RE = re.compile(r"\bс\s+\d{1,2}([:.]\d{2})?\s+(до|по)\s+\d{1,2}", re.I)
 REGULAR_RE = re.compile(r"кажд|ежедневн|по утрам|по вечерам", re.I)
+CLOCK_RE = re.compile(r"(^|\s)(в|до|к|с|около)\s+\d{1,2}([:.]\d{2})?(\s|$|[,.!?])", re.I)
+
+
+def _size(data: dict) -> int:
+    """Сколько всего разобрано — чтобы переспрос не заменил полный ответ пустым."""
+    return sum(len(data.get(k) or []) for k in ("activities", "tasks_to_add", "reminders", "edits")) + \
+        bool(data.get("habit_identified")) + bool(data.get("answer"))
 
 
 def _problems(data: dict, text: str) -> list[str]:
@@ -296,8 +340,13 @@ def _problems(data: dict, text: str) -> list[str]:
         problems.append("В сообщении сказано, сколько времени назад это закончилось, — заполни ended_ago_min.")
     if acts and RANGE_RE.search(text) and not any(a.get("start") for a in acts):
         problems.append("В сообщении названо время «с … до …» — заполни start и end (ЧЧ:ММ).")
-    if REGULAR_RE.search(text) and any(str(r.get("repeat", "")).lower() == "once" for r in rems):
-        problems.append("Просят напоминать регулярно — у такого напоминания repeat \"daily\".")
+    elif acts and not rems and CLOCK_RE.search(text) and not any(a.get("start") or a.get("end") for a in acts):
+        problems.append("В сообщении названо время («в 23», «до 0:58») — перенеси его в start / end дел (ЧЧ:ММ).")
+    if REGULAR_RE.search(text) and rems and not any(str(r.get("repeat", "")).lower() == "daily" for r in rems):
+        problems.append("Что просят делать регулярно («каждый день …») — напоминание с repeat \"daily\" (время не сказано — "
+                        "time null); разовые оставь разовыми.")
+    if _size(data) == 0 and len(text) > 40:
+        problems.append("Ответ пустой, а в сообщении есть дела, планы или задачи — разбери их.")
     if text.strip().endswith("?") and data.get("intent") == "log" and not data.get("answer"):
         problems.append("Это вопрос: intent \"question\", ответ в answer.")
     for a in acts:
@@ -320,6 +369,9 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
         weekday=WEEKDAYS[now.weekday()],
         today=today_date,
         tomorrow=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
+        # Модель путает, какое число будет в пятницу, — даём готовый календарь на неделю вперёд
+        week=", ".join(f"{WEEKDAYS_SHORT[d.weekday()]} {d.strftime('%Y-%m-%d')}"
+                       for d in (now + timedelta(days=i) for i in range(1, 8))),
         tz=config.TIMEZONE,
         about=about.strip() or "о себе не рассказывал(а) — обращайся без рода: не «сделала/сделал», а «готово», «записано»",
         known_titles=", ".join(f"«{t}»" for t in known_titles) if known_titles else "пока нет",
@@ -348,7 +400,10 @@ async def parse_voice_text(text: str, known_titles: list | None = None, about: s
                              "\nВерни исправленный JSON целиком, без пояснений."}]
         raw2 = await _ask(retry)
         data2 = _load(raw2) if raw2 else None
-        if data2 is not None and (data is None or len(_problems(data2, text)) < len(problems)):
+        # Исправленный ответ берём, только если он ничего не потерял: 20.10 переспрос вернул пустой JSON
+        # («ошибок меньше») — и бот ответил «не нашёл здесь дел» на сообщение из шести дел
+        if data2 is not None and (data is None or (len(_problems(data2, text)) < len(problems)
+                                                   and _size(data2) >= _size(data))):
             data = data2
 
     if data is None:
@@ -366,20 +421,25 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
         if not isinstance(data[key], list):
             data[key] = []
 
-    # Категория — только из фиксированного списка, иначе /summary дробится на «залипание в телефоне», «телефон», …
-    lower_map = {c.lower(): c for c in CATEGORIES}
     data["activities"] = [a for a in data["activities"] if isinstance(a, dict)]
     for act in data["activities"]:
-        act["category"] = lower_map.get(str(act.get("category", "")).strip().lower(), "Другое")
+        act["category"] = clean_category(act.get("category"))
         timeline.normalize_title(act)          # «Поела» → «Еда», «зал» → «Тренировка»
         timeline.refine_meal(act, text)        # «Еда», а в сообщении «позавтракала» → «Завтрак»
     timeline.resolve_times(data["activities"], now.replace(tzinfo=None))   # время считает код
     data["activities"].sort(key=lambda a: a["start_time"])
 
     # Модель иногда присылает задачи/привычку объектами — в БД нужны строки
-    data["tasks_to_add"] = _clean_tasks(data.get("tasks_to_add"), now)
+    tasks = _clean_tasks(data.get("tasks_to_add"), now)
     data["habit_identified"] = _as_text(data.get("habit_identified")) or None
-    data["reminders"] = _clean_reminders(data.get("reminders"), today_date, text)
+    data["reminders"] = _clean_reminders(data.get("reminders"), now, text)
+    # Разовое «напоминание» без времени — это задача на тот день («сегодня решить, что отдать тёте»),
+    # если человек сам не просил напомнить
+    if not NAG_RE.search(text):
+        for rem in [r for r in data["reminders"] if r["date"] and not r["time"]]:
+            data["reminders"].remove(rem)
+            tasks.append({"text": rem["text"], "due": rem["date"]})
+    data["tasks_to_add"] = _dedupe_tasks(tasks)
     data["edits"] = _clean_edits(data.get("edits"))
     data["intent"] = data["intent"] if data["intent"] in ("log", "question", "correction", "chat") else "log"
     data["answer"] = _as_text(data.get("answer")).replace("**", "")
@@ -387,23 +447,43 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
     return data
 
 
+NAG_RE = re.compile(r"напомн|напоминай", re.I)
+# Еда и подъём — не задачи: «позавтракать (завтра)» только засоряет /todo
+ROUTINE_TASK_RE = re.compile(r"^(по)?(завтракать|обедать|ужинать|есть|кушать|перекусить)$|^(пораньше\s+)?встать(\s+пораньше)?$", re.I)
+
+
+def _resolve_date(value, now: datetime):
+    """today / tomorrow / thu / ГГГГ-ММ-ДД → ГГГГ-ММ-ДД (дни недели — ближайший такой день, сегодня включительно)."""
+    v = str(value or "").strip().lower()
+    if v == "today":
+        return now.strftime("%Y-%m-%d")
+    if v == "tomorrow":
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    weekday = timeline.weekday_date(v, now.date())
+    return weekday.strftime("%Y-%m-%d") if weekday else _clean_date(v)
+
+
 def _clean_tasks(raw, now: datetime) -> list:
     """[{text, due}]: due — ГГГГ-ММ-ДД или None. Модель иногда присылает строки — тоже принимаем."""
     result = []
     for item in raw or []:
         text = _as_text(item)
-        if not text:
+        if not text or ROUTINE_TASK_RE.match(text.strip().rstrip(".")):
             continue
-        due = item.get("due") if isinstance(item, dict) else None
-        due = str(due or "").strip().lower()
-        if due == "today":
-            due = now.strftime("%Y-%m-%d")
-        elif due == "tomorrow":
-            due = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        else:
-            due = _clean_date(due)
+        due = _resolve_date(item.get("due") if isinstance(item, dict) else None, now)
         result.append({"text": text[0].upper() + text[1:], "due": due})
     return result
+
+
+def _dedupe_tasks(tasks: list) -> list:
+    """«Купить корм либо сегодня, либо завтра, либо в пятницу» модель делает тремя задачами — оставляем одну
+    с самым поздним сроком (это и есть крайний срок)."""
+    result = {}
+    for t in tasks:
+        key = t["text"].lower()
+        if key not in result or (t["due"] or "") > (result[key]["due"] or ""):
+            result[key] = t
+    return list(result.values())
 
 
 def _clean_time(value):
@@ -428,7 +508,7 @@ def _evening_fix(time, source_text):
     return time
 
 
-def _clean_reminders(raw, today_date, source_text="") -> list:
+def _clean_reminders(raw, now: datetime, source_text="") -> list:
     """[{text, time, date}]: time — ЧЧ:ММ, 'meal' или None; date — ГГГГ-ММ-ДД для разовых, None для ежедневных."""
     result = []
     for item in raw or []:
@@ -442,7 +522,7 @@ def _clean_reminders(raw, today_date, source_text="") -> list:
         time = "meal" if str(item.get("time")).strip().lower() == "meal" else _clean_time(item.get("time"))
         time = _evening_fix(time, source_text)
         once = str(item.get("repeat", "")).lower() == "once" and time != "meal"
-        date = (_clean_date(item.get("date")) or today_date) if once else None
+        date = (_resolve_date(item.get("date"), now) or now.strftime("%Y-%m-%d")) if once else None
         # Время в тексте («В 22:00 читать») модель иногда дописывает сама — убираем, бот добавит его, где нужно
         text = TIME_PREFIX_RE.sub("", text).strip() or text
         if once and time and str(item.get("kind", "")).lower() == "event":

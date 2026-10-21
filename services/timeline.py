@@ -17,7 +17,7 @@ CANONICAL = [
     (r"ужин", "Ужин", "Еда", "routine"),
     (r"^(по)?ел[аи]?\b|^еда$|покушал|^перекус|^приём пищи|^прием пищи", "Еда", "Еда", "routine"),
     (r"^(по)?спал|^сон$|^дневной сон", "Сон", "Сон", "routine"),
-    (r"трениров|спортзал|^зал$|^в зал|фитнес|качалк", "Тренировка", "Спорт", "productive"),
+    (r"трениров|спортзал|^зал$|^в зал|фитнес|качалк|^заняти[яе] спорт|^спорт$", "Тренировка", "Спорт", "productive"),
     (r"залип|в телефоне|соцсет|тикток|tiktok|инстаграм|instagram|рилс|reels|ленту|шортс", "Залипание в телефоне", "Телефон", "unproductive"),
     (r"сериал", "Сериал", "Отдых", None),
     (r"^игр|^играл|^поиграл", "Игры", "Отдых", None),
@@ -31,7 +31,8 @@ CANONICAL_HINT = "Еда (или Завтрак / Обед / Ужин), Сон, 
 
 
 def normalize_title(act: dict):
-    title = (act.get("title") or "").strip()
+    # Подробности в скобках («Завтрак (гречка)») дробят статистику на разные дела — убираем
+    title = re.sub(r"\s*\([^)]*\)\s*$", "", (act.get("title") or "").strip()) or (act.get("title") or "").strip()
     low = title.lower()
     for pattern, name, category, utility in CANONICAL:
         if re.search(pattern, low):
@@ -72,14 +73,42 @@ def _int(value):
         return None
 
 
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def weekday_date(value, today: date_cls, forward: bool = True) -> date_cls | None:
+    """«thu» / «thursday» → ближайший четверг: вперёд (для планов) или назад (для сделанного), сегодня включительно.
+    Модель путает, какое число будет в четверг, — поэтому она называет день недели, а число считает код."""
+    v = str(value or "").strip().lower()
+    key = v[:3] if v in WEEKDAYS or v in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday") else None
+    if not key:
+        return None
+    target = WEEKDAYS.index(key)
+    if forward:
+        return today + timedelta(days=(target - today.weekday()) % 7)
+    return today - timedelta(days=(today.weekday() - target) % 7)
+
+
 def _day(value, now: datetime) -> date_cls:
     v = str(value or "").strip().lower()
     if v == "yesterday":
         return now.date() - timedelta(days=1)
+    weekday = weekday_date(v, now.date(), forward=False)
+    if weekday:
+        return weekday
     try:
         return datetime.strptime(v, "%Y-%m-%d").date()
     except ValueError:
         return now.date()
+
+
+def _rolled_back(s: datetime, e: datetime, now: datetime):
+    """«В 23 начала играть», сказанное в 00:58, — это вчерашние 23:00, а не сегодняшние (будущее).
+    Дела — всегда прошлое, поэтому время, ушедшее в будущее, переносим на сутки назад, если так выходит
+    недавнее прошлое (до 12 ч). «В 18 пойду работать», сказанное в 15:00, так не переносится — это план."""
+    if s > now + timedelta(minutes=5) and now - (s - timedelta(days=1)) <= timedelta(hours=12):
+        return s - timedelta(days=1), e - timedelta(days=1)
+    return s, e
 
 
 def _at(day: date_cls, hm) -> datetime:
@@ -99,39 +128,50 @@ def resolve_times(activities: list, now: datetime) -> None:
     """Проставляет каждому делу start_time / end_time / duration_minutes / time_exact по словам модели.
     now — местное время без часового пояса."""
     slots = []  # (start, end, exact) или None — «время не сказано»
+    loose_start = []  # сказан только конец, а начала и длительности нет — начало можно взять у предыдущего дела
+    start_named = []  # начало сказано — его не двигаем (в будущем — значит, это план, а не сделанное)
     for act in activities:
         day = _day(act.get("day"), now)
+        day_named = str(act.get("day") or "").strip().lower() not in ("", "today", "none", "null")
         start, end = _hm(act.get("start")), _hm(act.get("end"))
         dur, ago = _int(act.get("duration_min")), _int(act.get("ended_ago_min"))
         part = str(act.get("part_of_day") or "").lower()
+        loose_start.append(not start and dur is None and bool(end or ago is not None))
+        start_named.append(bool(start))
 
+        slot = None
         if start and end:
             s, e = _at(day, start), _at(day, end)
             if e <= s:                      # «с 23 до 7» — через полночь
                 e += timedelta(days=1)
                 if e > now + timedelta(minutes=5):
                     s, e = s - timedelta(days=1), e - timedelta(days=1)
-            slots.append((s, e, True))
+            slot = (s, e, True)
         elif start:
             s = _at(day, start)
-            slots.append((s, s + timedelta(minutes=dur or DEFAULT_MIN), dur is not None))
+            slot = (s, s + timedelta(minutes=dur or DEFAULT_MIN), dur is not None)
         elif end:
             e = _at(day, end)
-            slots.append((e - timedelta(minutes=dur or DEFAULT_MIN), e, dur is not None))
+            slot = (e - timedelta(minutes=dur or DEFAULT_MIN), e, dur is not None)
         elif ago is not None:
             e = now - timedelta(minutes=ago)
-            slots.append((e - timedelta(minutes=dur or DEFAULT_MIN), e, dur is not None))
+            slot = (e - timedelta(minutes=dur or DEFAULT_MIN), e, dur is not None)
         elif part in PART_OF_DAY:
             h, m, default = PART_OF_DAY[part]
             s = _at(day, (h, m))
-            slots.append((s, s + timedelta(minutes=dur or default), False))
+            slot = (s, s + timedelta(minutes=dur or default), False)
         elif _legacy(act) and not act.get("duration_min"):
             s, e = _legacy(act)
             slots.append((s, e, False))
+            continue
         else:
             slots.append(None)
             act["_dur"] = dur or DEFAULT_MIN
             act["_day"] = day
+            continue
+        if not day_named and ago is None:
+            slot = (*_rolled_back(slot[0], slot[1], now), slot[2])
+        slots.append(slot)
 
     # Дела без времени — подряд: после предыдущего известного, а если его нет — до следующего известного
     # или (для сегодня) до «сейчас»
@@ -156,11 +196,26 @@ def resolve_times(activities: list, now: datetime) -> None:
                 slots[k] = (cursor - timedelta(minutes=activities[k]["_dur"]), cursor, False)
                 cursor = slots[k][0]
 
+    # Прикинутое время не может уехать в будущее: сдвигаем так, чтобы закончилось «сейчас»
+    for i, (s, e, exact) in enumerate(slots):
+        if not exact and e > now and not start_named[i]:
+            slots[i] = (s - (e - now), now, exact)
+
+    # Дела из одного сообщения идут одно за другим: «час играла, после этого до 0:58 сидела в TikTok» —
+    # у TikTok сказан только конец, начало — там, где кончились игры
+    for i in range(1, n):
+        prev_end = slots[i - 1][1]
+        s, e, exact = slots[i]
+        if loose_start[i] and prev_end < e and e - prev_end <= timedelta(hours=6):
+            slots[i] = (prev_end, e, exact)
+    # …и не налезают друг на друга: прикинутое дело заканчивается там, где начинается следующее
+    for i in range(n - 2, -1, -1):
+        s, e, exact = slots[i]
+        next_start = slots[i + 1][0]
+        if not exact and s < next_start < e:
+            slots[i] = (s - (e - next_start), next_start, exact)
+
     for act, (s, e, exact) in zip(activities, slots):
-        # Прикинутое время не может уехать в будущее: сдвигаем так, чтобы закончилось «сейчас»
-        if not exact and e > now:
-            shift = e - now
-            s, e = s - shift, e - shift
         act["start_time"], act["end_time"] = s.isoformat(timespec="seconds"), e.isoformat(timespec="seconds")
         act["duration_minutes"] = max(1, int((e - s).total_seconds() // 60))
         act["time_exact"] = exact

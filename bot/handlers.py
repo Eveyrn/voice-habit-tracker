@@ -18,7 +18,9 @@ from database import db_manager
 from services import google_oauth
 from services.stt import transcribe_audio
 import groq
-from services.ai_parser import parse_voice_text, analyze_rhythm, CATEGORIES, PRIMARY_MODEL, QUOTA as ai_quota,     LIMIT_HIT as ai_limit
+from services import timeline
+from services.ai_parser import parse_voice_text, analyze_rhythm, condense_about, clean_category, CATEGORIES, PRIMARY_MODEL, \
+    REGULAR_RE, ABOUT_MAX, QUOTA as ai_quota, LIMIT_HIT as ai_limit
 from services.calendar_api import add_event, build_event
 
 router = Router()
@@ -87,6 +89,25 @@ def all_user_ids() -> list[int]:
 async def load_users():
     ACTIVE_USERS.clear()
     ACTIVE_USERS.update(await db_manager.active_user_ids())
+
+
+def _tidy_activity(title, category, utility):
+    act = {"title": title or "Дело", "category": clean_category(category),
+           "utility": utility if utility in UTILITY_LABEL else "routine"}
+    timeline.normalize_title(act)
+    return act["title"], act["category"], act["utility"]
+
+
+async def tidy_history():
+    """При запуске: старые «Играть», «Завтрак (гречка)», категории «unproductive» — к одному виду."""
+    changed = await db_manager.tidy_history(_tidy_activity)
+    if changed:
+        print(f"[tidy] приведено к одному виду записей: {changed}")
+    # Длинное «о себе», сохранённое до сжатия, — сжимаем один раз (оно уходит в каждый запрос к модели)
+    for uid, about in await db_manager.settings_with_key("about"):
+        if about and len(about) > ABOUT_MAX + 100:
+            await save_about(uid, about)
+            print(f"[tidy] сжато «о себе» пользователя {uid}")
 
 
 async def ensure_owner_about():
@@ -276,9 +297,34 @@ async def onboarding_about(message: types.Message, about_text: str) -> bool:
     """Шаг 1: если ждём «о себе» — сохраняем и переходим к шагу 2. True — сообщение обработано."""
     if await db_manager.get_setting(message.from_user.id, "onboarding") != "about":
         return False
-    await db_manager.set_setting(message.from_user.id, "about", about_text.strip()[:500])
+    await save_about(message.from_user.id, about_text)
     await db_manager.set_setting(message.from_user.id, "onboarding", "first_entry")
     await message.answer(f"Запомнил ✅\n\n{ONB_STEP2}")
+    return True
+
+
+async def save_about(user_id: int, text: str) -> str:
+    about = await condense_about(text)
+    await db_manager.set_setting(user_id, "about", about)
+    return about
+
+
+ABOUT_WAIT_MIN = 15  # после /about без текста следующее сообщение (голос или текст) — это «о себе»
+
+
+async def pending_about(message: types.Message, about_text: str) -> bool:
+    """Ждём «о себе» после /about — сохраняем. True — сообщение обработано."""
+    waiting = await db_manager.get_setting(message.from_user.id, "await_about")
+    if not waiting:
+        return False
+    await db_manager.set_setting(message.from_user.id, "await_about", "")
+    try:
+        if (_now_local().replace(tzinfo=None) - datetime.fromisoformat(waiting)) > timedelta(minutes=ABOUT_WAIT_MIN):
+            return False
+    except ValueError:
+        return False
+    about = await save_about(message.from_user.id, about_text)
+    await message.answer(f"Запомнил о тебе: {about}\n\nПоменять — снова /about.")
     return True
 
 
@@ -289,14 +335,14 @@ async def cmd_about(message: types.Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2 and parts[1].strip():
-        about = parts[1].strip()[:500]
-        await db_manager.set_setting(message.from_user.id, "about", about)
-        await message.answer(f"Запомнил: {about}")
+        about = await save_about(message.from_user.id, parts[1])
+        await message.answer(f"Запомнил о тебе: {about}")
         return
     current = await db_manager.get_setting(message.from_user.id, "about", "")
+    await db_manager.set_setting(message.from_user.id, "await_about", _now_local().replace(tzinfo=None).isoformat())
     await message.answer(
-        "Расскажи о себе одной фразой — так я лучше расслышу голосовые и пойму, что для тебя полезно:\n"
-        "/about Учусь на дизайнера, хожу в зал, работаю бариста\n\n"
+        "Расскажи о себе следующим сообщением — голосовым или текстом: чем занимаешься, что для тебя полезно, "
+        "к чему стремишься. Так я лучше расслышу голосовые и правильнее отмечу полезное.\n\n"
         f"Сейчас: {current or 'пусто'}"
     )
 
@@ -762,11 +808,20 @@ async def cmd_patterns(message: types.Message):
         await message.answer(header + "Пока недостаточно данных. Продолжай рассказывать о своих делах!")
         return
 
-    text = header + "📊 Повторяющиеся дела:\n\n"
-    for title, utility, count, last_date, avg_interval in patterns:
-        icon = "🟢" if utility == "productive" else ("⚪" if utility == "routine" else "🔴")
-        interval_txt = f"каждые ~{avg_interval} дн." if avg_interval > 0 else "пока 1 раз"
-        text += f"{icon} {title}: {count} дн. ({interval_txt}, посл. {last_date})\n"
+    repeating = [p for p in patterns if p[2] >= 2]
+    once = [p[0] for p in patterns if p[2] < 2]
+    text = header
+    if repeating:
+        text += "📊 Повторяющиеся дела:\n\n"
+        for title, utility, count, last_date, avg_interval in repeating:
+            icon = "🟢" if utility == "productive" else ("⚪" if utility == "routine" else "🔴")
+            every = "каждый день" if (avg_interval or 0) <= 1.2 else f"примерно раз в {round(avg_interval)} {_days_word(round(avg_interval))}"
+            last = datetime.strptime(last_date, "%Y-%m-%d").strftime("%d.%m") if last_date else "—"
+            text += f"{icon} {title}: {count} {_days_word(count)}, {every} (последний раз {last})\n"
+    else:
+        text += "📊 Повторяющихся дел пока нет — нужно, чтобы одно и то же дело было хотя бы в 2 разных днях.\n"
+    if once:
+        text += f"\nПока по разу: {', '.join(once[:20])}" + (f" и ещё {len(once) - 20}" if len(once) > 20 else "")
     await message.answer(text)
 
 
@@ -869,6 +924,25 @@ async def plans_for_day(user_id: int, date_str: str) -> list[str]:
             if r_date == date_str]
 
 
+def _covered_minutes(acts, day_str: str) -> int:
+    """Сколько минут дня покрыто делами — пересечения считаются один раз."""
+    day_start = datetime.strptime(day_str, "%Y-%m-%d")
+    day_end = day_start + timedelta(days=1)
+    intervals = []
+    for *_, duration, start, end in acts:
+        s = _parse_dt(start)
+        e = _parse_dt(end) or (s + timedelta(minutes=int(duration or 0)) if s else None)
+        if s and e and e > s:
+            intervals.append((max(s, day_start), min(e, day_end)))
+    covered, cursor = 0, day_start
+    for s, e in sorted(intervals):
+        s = max(s, cursor)
+        if e > s:
+            covered += (e - s).total_seconds() / 60
+            cursor = e
+    return int(covered)
+
+
 async def day_report(user_id: int, today_str: str) -> str:
     """Итог дня: баланс полезное/быт/телефон, категории, планы, привычки, открытые задачи."""
     stats = await db_manager.get_today_summary(user_id, today_str)
@@ -876,16 +950,23 @@ async def day_report(user_id: int, today_str: str) -> str:
 
     total = sum(int(d or 0) for _, _, d in stats)
     if total:
-        lines.append(f"📊 Итоги дня — учтено {_fmt_min(total)}\n")
+        # Дела могут накладываться (одно и то же записали дважды, «ела и смотрела сериал») — время дня
+        # считаем один раз, иначе выходило «учтено 26 ч» за сутки
+        covered = _covered_minutes(await db_manager.get_activities_for_day(user_id, today_str), today_str) or total
+        lines.append(f"📊 Итоги дня — учтено {_fmt_min(covered)}\n")
         by_utility = {}
         for utility, _, duration in stats:
+            utility = utility if utility in UTILITY_LABEL else "routine"
             by_utility[utility] = by_utility.get(utility, 0) + int(duration or 0)
         for key, label in (("productive", "🟢 Полезное"), ("routine", "⚪ Быт"), ("unproductive", "🔴 Прокрастинация")):
             if by_utility.get(key):
                 lines.append(f"{label}: {_fmt_min(by_utility[key])} · {round(by_utility[key] * 100 / total)}%")
+        if total - covered >= 15:
+            lines.append(f"(часть дел шла одновременно — {_fmt_min(total - covered)} посчитаны дважды)")
 
         by_category = {}
         for _, category, duration in stats:
+            category = clean_category(category)
             by_category[category] = by_category.get(category, 0) + int(duration or 0)
         top = sorted(by_category.items(), key=lambda kv: -kv[1])
         lines.append("\n" + " · ".join(f"{c} {_fmt_min(d)}" for c, d in top))
@@ -940,7 +1021,7 @@ async def handle_voice(message: types.Message):
         if not transcript.strip():
             await status_msg.edit_text("Не удалось распознать слова в аудиосообщении.")
             return
-        if await onboarding_about(message, transcript):
+        if await onboarding_about(message, transcript) or await pending_about(message, transcript):
             await status_msg.edit_text(f"«{transcript}»")
             return
         await process_entry(message, status_msg, transcript)
@@ -964,7 +1045,7 @@ async def handle_text(message: types.Message):
             await _notify_admins(message.bot, message.from_user,
                                  f"💬 Комментарий к ошибке #{feedback_id}: {message.text.strip()}")
             return
-    if await onboarding_about(message, message.text):
+    if await onboarding_about(message, message.text) or await pending_about(message, message.text):
         return
     status_msg = await message.reply("Разбираю...")
     await process_entry(message, status_msg, message.text.strip())
@@ -1294,7 +1375,9 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             activity_id = await db_manager.add_activity(user_id=user_id, title=title, category=category, utility=utility,
                                                         duration_min=duration, start_time=start_time, end_time=end_time,
                                                         calendar_event_id=event_id)
-            await db_manager.record_pattern(user_id=user_id, title=title, utility=utility, date_str=today_date)
+            # День — по самому делу: вчерашние игры, записанные в 00:59, — это вчера
+            await db_manager.record_pattern(user_id=user_id, title=title, utility=utility,
+                                            date_str=start_dt.strftime("%Y-%m-%d") if start_dt else today_date)
 
             time_label = f"{_hm(start_time)}–{_hm(end_time)} " if _hm(start_time) and _hm(end_time) else ""
             # Время прикинуто (пользователь его не называл) — показываем «≈», чтобы догадка не выглядела фактом
@@ -1333,9 +1416,14 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         if habit:
             daily = [(r_id, r_text) for r_id, r_text, _, r_date in await db_manager.get_reminders(user_id) if not r_date]
             match = _match_habit(habit, daily)
-            if match:
+            if not match and REGULAR_RE.search(transcript):
+                # «Каждый день заходить в Sky» — это просьба о новой привычке, а не отметка «сделано»
+                lines.append(f"\n⏰ Во сколько напоминать каждый день «{habit}»? Напиши, например:\n/remind 10:00 {habit}")
+                habit = None
+            elif match:
                 habit = match[1]
                 await db_manager.mark_reminder_sent(match[0], today_date)  # сегодня уже сделано — не напоминать
+        if habit:
             streak = await db_manager.update_habit(user_id, habit, today_date)
             lines.append(f"\n✅ {habit} — отмечено (серия: {streak} дн.)")
 

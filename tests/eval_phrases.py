@@ -3,11 +3,13 @@
 
     python tests/eval_phrases.py            # каждую фразу по разу
     python tests/eval_phrases.py --runs 3   # по 3 раза — видно, стабильна ли модель
+    python tests/eval_phrases.py --only тикток   # только фразы с этим словом (бережёт квоту)
 
 Модель от раза к разу отвечает по-разному, поэтому одна удачная проверка ничего не гарантирует —
 смотрите на «N из N».
 """
 import os
+import re
 import sys
 import asyncio
 from datetime import datetime, timedelta
@@ -16,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytz  # noqa: E402
 import config  # noqa: E402
+from services import ai_parser  # noqa: E402
 from services.ai_parser import parse_voice_text, LAST_USAGE  # noqa: E402
 from bot.handlers import CORRECTION_RE, QUESTION_RE  # noqa: E402
 
@@ -99,19 +102,57 @@ CASES = [
     ("Сегодня что у нас?", CONTEXT_HABIT,
      lambda r, now: None if r["intent"] == "question" and r["answer"] and not acts(r)
      else f"ждали вопрос с ответом: intent={r['intent']} answer={r['answer']!r}"),
+
+    # 21.10: в 00:58 «в 23» стало будущим («Игры ещё впереди»), а TikTok наложился на игры
+    ("Где-то в 23 начала играть с друзьями, где-то час поиграла. После этого до 0:58 сидела в тиктоке", "",
+     lambda r, now: None if (g := one(r, "Игры")) and (p := one(r, "Залипание в телефоне"))
+     and dt(g["start_time"]).date() == now.date() - timedelta(days=1) and 22 <= dt(g["start_time"]).hour <= 23
+     and near(dt(p["end_time"]), now, 5) and dt(p["start_time"]) >= dt(g["end_time"]) - timedelta(minutes=5)
+     else f"ждали Игры вчера ~23:00 и телефон после них до 00:58: {acts(r)}", "2026-10-21 00:58"),
+
+    # 21.10: на такой список бот ответил «не нашёл дел»; модель путала, какое число в четверг
+    ("надо в четверг в 14 к стоматологу\nкупить корм коту либо сегодня, либо завтра, либо в пятницу\n"
+     "решить, что подарить брату (сегодня)\nпостирать шторы в субботу\n\nИ каждый день заходить в игру за наградами", "",
+     lambda r, now: None if any(x["date"] == "2026-10-22" and "14:00" in x["text"] for x in r["reminders"])
+     and len([t for t in r["tasks_to_add"] if "корм" in t["text"].lower()]) == 1
+     and any("штор" in t["text"].lower() and t["due"] == "2026-10-24" for t in r["tasks_to_add"])
+     else f"ждали стоматолог чт 22.10 14:00, одну задачу про корм, шторы сб 24.10: "
+          f"tasks={r['tasks_to_add']} rem={r['reminders']}", "2026-10-21 10:00"),
+
+    ("Завтра надо убраться в квартире, поработать, пораньше встать, позавтракать и пообедать", "",
+     lambda r, now: None if any("убра" in t["text"].lower() for t in r["tasks_to_add"])
+     and not any(re.search(r"завтрак|обед|встать", t["text"].lower()) for t in r["tasks_to_add"])
+     else f"ждали задачи без еды и подъёма: {r['tasks_to_add']}"),
 ]
 
 
-async def main(runs: int):
+def freeze(at: str | None):
+    """Подменяет «сейчас» для модели и кода — для фраз, где важно время суток (после полуночи и т.п.)."""
+    if not at:
+        ai_parser.datetime = datetime
+        return now_local()
+    fixed = datetime.strptime(at, "%Y-%m-%d %H:%M")
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return tz.localize(fixed) if tz else fixed
+    ai_parser.datetime = Frozen
+    return fixed
+
+
+async def main(runs: int, only: str | None):
     total_ok, tokens = 0, []
-    for phrase, context, check in CASES:
+    cases = [c for c in CASES if not only or only.lower() in c[0].lower()]
+    for phrase, context, check, *at in cases:
         results = []
         # Как в боте: правила поправок в подсказке — только для вопросов и поправок
         with_edits = bool(CORRECTION_RE.search(phrase) or QUESTION_RE.search(phrase))
         for _ in range(runs):
             LAST_USAGE.clear()
+            now = freeze(at[0] if at else None)
             r = await parse_voice_text(phrase, KNOWN_TITLES, "", context, with_edits=with_edits)
-            results.append(check(r, now_local()))
+            results.append(check(r, now))
             if LAST_USAGE:
                 tokens.append(LAST_USAGE["total"])
         ok = sum(1 for e in results if e is None)
@@ -121,7 +162,7 @@ async def main(runs: int):
         print(f"{mark} {ok}/{runs}  {phrase}{used}")
         for e in {e for e in results if e}:
             print(f"      {e}")
-    print(f"\nИтого: {total_ok}/{len(CASES) * runs}")
+    print(f"\nИтого: {total_ok}/{len(cases) * runs}")
     if tokens:
         print(f"Токенов на сообщение (вход + ответ, последний запрос): в среднем {sum(tokens) // len(tokens)}, "
               f"от {min(tokens)} до {max(tokens)}")
@@ -129,4 +170,5 @@ async def main(runs: int):
 
 if __name__ == "__main__":
     runs = int(sys.argv[sys.argv.index("--runs") + 1]) if "--runs" in sys.argv else 1
-    asyncio.run(main(runs))
+    only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
+    asyncio.run(main(runs, only))

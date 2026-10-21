@@ -12,7 +12,7 @@ import config
 from bot.handlers import (
     router, BOT_COMMANDS, ADMIN_COMMANDS, reminder_keyboard, backup_file, BACKUP_CAPTION,
     day_report, rhythm_report, plans_for_day, all_user_ids, load_users, ensure_owner_about, oauth_callback,
-    ask_gaps, tasks_for_morning,
+    ask_gaps, tasks_for_morning, tidy_history,
 )
 from services import google_oauth, web_pages
 from database.db_manager import (
@@ -141,6 +141,7 @@ async def main():
     await init_db()
     await load_users()
     await ensure_owner_about()
+    await tidy_history()
 
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()

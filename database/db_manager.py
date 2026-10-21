@@ -183,29 +183,10 @@ def _pattern_title(title: str) -> str:
     return title[:1].upper() + title[1:]
 
 async def record_pattern(user_id: int, title: str, utility: str, date_str: str):
-    title_clean = _pattern_title(title)
+    """Вызывается после add_activity: считаем ритм по самим делам — тогда и запись «задним числом»
+    (вчерашние игры, записанные после полуночи) встаёт в свой день."""
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, count_logs, last_performed, avg_interval_days FROM patterns WHERE user_id = ? AND title = ?', (user_id, title_clean)) as cursor:
-            row = await cursor.fetchone()
-        
-        if row:
-            p_id, count, last_date, avg_interval = row
-            if last_date != date_str:
-                d_last = datetime.strptime(last_date, "%Y-%m-%d")
-                d_curr = datetime.strptime(date_str, "%Y-%m-%d")
-                interval = max(1, (d_curr - d_last).days)
-                new_avg = interval if count == 1 else (avg_interval * (count - 1) + interval) / count
-                count += 1
-                await db.execute('''
-                    UPDATE patterns 
-                    SET count_logs = ?, last_performed = ?, avg_interval_days = ?
-                    WHERE id = ?
-                ''', (count, date_str, round(new_avg, 1), p_id))
-        else:
-            await db.execute('''
-                INSERT INTO patterns (user_id, title, utility, count_logs, last_performed, avg_interval_days)
-                VALUES (?, ?, ?, 1, ?, 0)
-            ''', (user_id, title_clean, utility, date_str))
+        await _recount_patterns(db, user_id, [title])
         await db.commit()
 
 async def get_top_patterns(user_id: int):
@@ -402,6 +383,12 @@ async def set_setting(user_id, key, value):
             'ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value', (user_id, key, str(value)))
         await db.commit()
 
+async def settings_with_key(key):
+    """[(user_id, value)] — у всех пользователей."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id, value FROM settings WHERE key = ?', (key,)) as cursor:
+            return await cursor.fetchall()
+
 async def get_unproductive_minutes(user_id, date_str):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -428,28 +415,50 @@ def backup_bytes() -> bytes:
     os.remove(tmp_path)
     return data
 
-async def _recount_patterns(db, user_id, titles):
-    """Пересчитывает ритмы по оставшимся делам — после удаления или переименования.
+async def _recount_patterns(db, user_id, titles=None):
+    """Пересчитывает ритмы по самим делам (titles=None — все) — после записи, удаления или переименования.
     Иначе удалённое дело осталось бы в анализе (или пропало, хотя в другой записи за тот же день оно есть)."""
-    affected = {_pattern_title(t) for t in titles if t}
-    if not affected:
-        return
     async with db.execute(
-        'SELECT title, utility, COALESCE(substr(start_time, 1, 10), substr(created_at, 1, 10)) FROM activities WHERE user_id = ?',
+        'SELECT title, utility, COALESCE(substr(start_time, 1, 10), substr(created_at, 1, 10)) FROM activities '
+        'WHERE user_id = ? ORDER BY start_time',
         (user_id,)
     ) as cursor:
         remaining = await cursor.fetchall()
+    affected = {_pattern_title(t) for t in (titles if titles is not None else [r[0] for r in remaining]) if t}
     for t in affected:
         matches = [(u, day) for title, u, day in remaining if _pattern_title(title) == t and day]
         days = sorted({day for _, day in matches})
         if days:
+            first, last = (datetime.strptime(d, "%Y-%m-%d") for d in (days[0], days[-1]))
+            avg = round((last - first).days / (len(days) - 1), 1) if len(days) > 1 else 0
             await db.execute('''
                 INSERT INTO patterns (user_id, title, utility, count_logs, last_performed, avg_interval_days)
-                VALUES (?, ?, ?, ?, ?, 0)
-                ON CONFLICT(user_id, title) DO UPDATE SET count_logs = excluded.count_logs, last_performed = excluded.last_performed
-            ''', (user_id, t, matches[0][0], len(days), days[-1]))
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, title) DO UPDATE SET utility = excluded.utility, count_logs = excluded.count_logs,
+                    last_performed = excluded.last_performed, avg_interval_days = excluded.avg_interval_days
+            ''', (user_id, t, matches[-1][0], len(days), days[-1], avg))
         else:
             await db.execute('DELETE FROM patterns WHERE user_id = ? AND title = ?', (user_id, t))
+
+
+async def tidy_history(fix) -> int:
+    """Старые записи (до справочника названий и категорий) — к одному виду: fix(title, category, utility) →
+    (title, category, utility). Ритмы — заново по делам. Безопасно запускать при каждом старте."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT id, title, category, utility FROM activities') as cursor:
+            rows = await cursor.fetchall()
+        changed = 0
+        for a_id, title, category, utility in rows:
+            new = fix(title, category, utility)
+            if new != (title, category, utility):
+                await db.execute('UPDATE activities SET title = ?, category = ?, utility = ? WHERE id = ?', (*new, a_id))
+                changed += 1
+        await db.execute('DELETE FROM patterns')
+        async with db.execute('SELECT DISTINCT user_id FROM activities') as cursor:
+            for (uid,) in await cursor.fetchall():
+                await _recount_patterns(db, uid)
+        await db.commit()
+        return changed
 
 async def delete_items(user_id, activity_ids=(), task_ids=(), reminder_ids=()):
     """Удаляет дела/задачи/напоминания пользователя по id.
