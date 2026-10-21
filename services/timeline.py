@@ -56,6 +56,55 @@ def refine_meal(act: dict, text: str):
         act["title"] = found[0]
 
 
+NOW_RE = re.compile(r"\bсейчас\b|\bв данный момент\b|\bпрямо щас\b|\bщас\b", re.I)
+FUTURE_RE = re.compile(r"пойд|поед|буду|будем|собира|потом|через|позже|скоро|начну|сяду|лягу", re.I)
+
+
+PLAN_RE = re.compile(r"\b(буду|будем|пойду|пойдём|пойдем|поеду|поедем|собираюсь|собираемся|начну|сяду|планирую)\b", re.I)
+
+
+def _clauses(text: str) -> list[str]:
+    """Части фразы: по предложениям и по «, а …», «, потом …» — у каждой части своё время (было / будет)."""
+    return [c for c in re.split(r"[.!?;\n]|,\s*(?=(?:а|но|и|потом|затем|дальше)\s)", text or "", flags=re.I) if c.strip()]
+
+
+def _mentions(act: dict, clause: str) -> bool:
+    """Говорится ли в этой части о деле: «работать над ботом» ↔ «Работа над ботом» (по началам слов)."""
+    low = clause.lower()
+    return any(w[:5] in low for w in re.findall(r"[а-яёa-z]{4,}", (act.get("title") or "").lower()))
+
+
+def split_plans(activities: list, text: str) -> list[str]:
+    """«Дальше буду работать над ботом» модель иногда кладёт в сделанные дела — и бот записывал работу «до сейчас».
+    Дело без времени, о котором сказано только в будущем, — план: убираем из дел, возвращаем названия."""
+    clauses = _clauses(text)
+    plans = []
+    for act in list(activities):
+        if any(act.get(k) for k in ("start", "end", "part_of_day")) or act.get("ended_ago_min") is not None:
+            continue
+        hits = [c for c in clauses if _mentions(act, c)]
+        if hits and all(PLAN_RE.search(c) for c in hits):
+            activities.remove(act)
+            plans.append(act.get("title") or "Дело")
+    return plans
+
+
+def mark_ongoing(activities: list, text: str):
+    """«Я сейчас завтракаю» в 12:55 — завтрак идёт прямо сейчас, а не «утром» (модель ставила 08:00–09:00).
+    Ищем часть фразы со «сейчас» без будущего («сейчас пойду гулять» — это план) и делаем её дело
+    закончившимся «только что»."""
+    clauses = [c for c in _clauses(text) if NOW_RE.search(c) and not FUTURE_RE.search(c)]
+    if not clauses:
+        return
+    timeless = [a for a in activities if not any(a.get(k) for k in ("start", "end")) and a.get("ended_ago_min") is None]
+    for clause in clauses:
+        named = [a for a in timeless if _mentions(a, clause)]
+        target = named[0] if named else (timeless[0] if len(timeless) == 1 and len(clauses) == 1 else None)
+        if target:
+            target["ended_ago_min"], target["part_of_day"] = 0, None
+            timeless.remove(target)
+
+
 def _hm(value):
     m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", str(value).strip()) if value else None
     if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:

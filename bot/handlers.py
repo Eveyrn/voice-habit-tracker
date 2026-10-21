@@ -750,7 +750,7 @@ async def _reminders_view(user_id: int):
     for r_id, r_text, r_time, r_date in reminders:
         when = format_when(r_time, r_date)
         text += f"{when} — {r_text}\n"
-        builder.button(text=f"🗑 {r_text[:28]}", callback_data=f"remdel_{r_id}")
+        builder.button(text=f"🗑 {_short(r_text)}", callback_data=f"remdel_{r_id}")
     builder.adjust(1)
     return text, builder.as_markup()
 
@@ -866,7 +866,7 @@ async def _todo_view(user_id: int):
         for task_id, title, due in sorted(items, key=lambda x: x[2] or ""):
             label = f" ({datetime.strptime(due, '%Y-%m-%d').strftime('%d.%m')})" if due and group in ("Позже", "⚠️ Просрочено") else ""
             text += f"- {title}{label}\n"
-            builder.button(text=f"✅ {title[:28]}", callback_data=f"done_{task_id}")
+            builder.button(text=f"✅ {_short(title)}", callback_data=f"done_{task_id}")
     builder.adjust(1)
     return text, builder.as_markup()
 
@@ -1260,6 +1260,14 @@ def _match_habit(habit: str, daily: list):
     return None
 
 
+def _short(text: str, limit: int = 40) -> str:
+    """Подпись кнопки: по целому слову и с «…», а не «после приема пищ»."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return (cut if len(cut) > limit // 2 else text[:limit]) + "…"
+
+
 def _join(lines):
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -1306,6 +1314,10 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
         # 1. Поправки (могут прийти и вместе с рассказом)
         edit_lines = await apply_edits(user_id, analysis["edits"], now)
         lines.extend(edit_lines)
+        # «Дальше буду работать над ботом» — план, а не сделанное (код убрал его из дел)
+        plan_lines = [f"⏭ «{title}» ещё впереди — не записываю как сделанное. Напомнить? Скажи, например: "
+                      "«напомни в 18:00 …»" for title in analysis.get("planned") or []]
+        lines.extend(plan_lines)
 
         activities = analysis["activities"]
         has_new = bool(activities or analysis["tasks_to_add"] or analysis["reminders"] or analysis["habit_identified"])
@@ -1317,7 +1329,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
                 lines.append(("\n" if edit_lines else "") + analysis["answer"])
                 if analysis["intent"] == "question" and PERIOD_RE.search(transcript):
                     lines.append(await period_note(user_id, now))
-            elif not edit_lines:
+            elif not edit_lines and not plan_lines:
                 lines.append("Не нашёл здесь дел, задач или напоминаний. Расскажи, что было, "
                              "или спроси, например: «что у меня сегодня?»")
             await status_msg.edit_text(_join(lines), reply_markup=_feedback_only())
@@ -1467,7 +1479,7 @@ async def process_entry(message: types.Message, status_msg: types.Message, trans
             for r_id, r_text, r_time, _ in await db_manager.get_reminders(user_id):
                 if r_time == MEAL:
                     lines.append(f"\n🍽 Не забудь: {r_text}")
-                    builder.button(text=f"✅ {r_text[:30]}", callback_data=f"remdone_{r_id}")
+                    builder.button(text=f"✅ {_short(r_text)}", callback_data=f"remdone_{r_id}")
 
         if created["a"] or created["t"] or created["r"]:
             entry_id = await db_manager.add_entry(user_id, transcript, created, now.replace(tzinfo=None).isoformat())

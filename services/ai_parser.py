@@ -426,6 +426,8 @@ def _normalize(data: dict, text: str, now: datetime) -> dict:
         act["category"] = clean_category(act.get("category"))
         timeline.normalize_title(act)          # «Поела» → «Еда», «зал» → «Тренировка»
         timeline.refine_meal(act, text)        # «Еда», а в сообщении «позавтракала» → «Завтрак»
+    data["planned"] = timeline.split_plans(data["activities"], text)  # «буду работать» — план, не сделанное
+    timeline.mark_ongoing(data["activities"], text)  # «сейчас завтракаю» — до «сейчас», а не «утром»
     timeline.resolve_times(data["activities"], now.replace(tzinfo=None))   # время считает код
     data["activities"].sort(key=lambda a: a["start_time"])
 
